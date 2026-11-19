@@ -27,6 +27,8 @@ UNI_URLS = {
     'Mid':   ['https://archives.nseindia.com/content/indices/ind_niftymidcap150list.csv', 'https://www.niftyindices.com/IndexConstituent/ind_niftymidcap150list.csv'],
     'Small': ['https://archives.nseindia.com/content/indices/ind_niftysmallcap250list.csv', 'https://www.niftyindices.com/IndexConstituent/ind_niftysmallcap250list.csv']}
 STRAT_WK = {'brk': 6, 'pb': 3, 'mr': 2}
+USE_NSE = False                                     # the phone build sets True: prices come from NSE's own daily files (Yahoo blocks GitHub's servers)
+NSE_START = dt.date(2016, 11, 1)                    # how far back to build history (it deepens a little on every run)
 BUDGET_MIN = None                                   # set by the phone build: stop downloading after this many minutes and carry on next run
 LOCK = threading.Lock()
 STATUS = {'running': False, 'msg': 'Idle', 'done': 0, 'total': 0}
@@ -373,6 +375,115 @@ def backtest(p):
             'note': 'Uses today\'s index members, so stocks that dropped out or were delisted are missing (survivorship bias). Results are flattering. Daily prices only, no intraday detail.'}
 
 
+
+# ---------------------------------------------------------------- NSE's own daily files (used when Yahoo blocks the server)
+def nse_dir(): d = os.path.join(DATA, 'nse'); os.makedirs(d, exist_ok=True); return d
+def bhav_url(d): return 'https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_%s.csv' % d.strftime('%d%m%Y')
+def idx_url(d): return 'https://archives.nseindia.com/content/indices/ind_close_all_%s.csv' % d.strftime('%d%m%Y')
+def _num(x):
+    try: return float(str(x).replace(',', '').strip())
+    except Exception: return None
+def fetch_day(d, wanted):
+    """Returns None for a market holiday, else {'s': {symbol: [o,h,l,c,prevclose,vol]}, 'n': [o,h,l,c] or None, 'v': vix or None}."""
+    try: raw = http_get(bhav_url(d), tries=2, timeout=40).decode('utf-8', 'replace')
+    except urllib.error.HTTPError as e:
+        if e.code in (403, 404): return None
+        raise
+    rows = csv.reader(io.StringIO(raw)); hdr = [h.strip().upper() for h in next(rows)]; ix = {h: i for i, h in enumerate(hdr)}
+    need = ('SYMBOL', 'SERIES', 'PREV_CLOSE', 'OPEN_PRICE', 'HIGH_PRICE', 'LOW_PRICE', 'CLOSE_PRICE', 'TTL_TRD_QNTY')
+    if any(k not in ix for k in need): raise RuntimeError('The NSE price file has a new layout: ' + ','.join(hdr)[:120])
+    out = {}
+    for r in rows:
+        if len(r) < len(hdr): continue
+        sym = r[ix['SYMBOL']].strip()
+        if sym not in wanted or r[ix['SERIES']].strip() != 'EQ': continue
+        v = [_num(r[ix[k]]) for k in ('OPEN_PRICE', 'HIGH_PRICE', 'LOW_PRICE', 'CLOSE_PRICE', 'PREV_CLOSE', 'TTL_TRD_QNTY')]
+        if None in v or v[3] <= 0: continue
+        out[sym] = [round(v[0], 2), round(v[1], 2), round(v[2], 2), round(v[3], 2), round(v[4], 2), int(v[5])]
+    n = vix = None
+    try:
+        r2 = list(csv.reader(io.StringIO(http_get(idx_url(d), tries=2, timeout=40).decode('utf-8', 'replace')))); h2 = [h.strip().upper() for h in r2[0]]
+        ni = h2.index('INDEX NAME'); oi, hi, li, ci = (next(i for i, h in enumerate(h2) if h.startswith(p)) for p in ('OPEN INDEX', 'HIGH INDEX', 'LOW INDEX', 'CLOSING INDEX'))
+        for r in r2[1:]:
+            if len(r) <= ci: continue
+            nm = r[ni].strip().upper()
+            if nm == 'NIFTY 50': q = [_num(r[k]) for k in (oi, hi, li, ci)]; n = q if None not in q else None
+            elif nm == 'INDIA VIX': vix = _num(r[ci])
+    except Exception as e: log('Index file problem for', d, str(e)[:80])
+    return {'s': out, 'n': n, 'v': vix}
+
+def nse_load(uni, deadline_min=None):
+    wanted = set(uni); folder = nse_dir(); hol_path = os.path.join(folder, '_holidays.json'); hol = set(jload(hol_path, [])); today = now().date(); t_end = time.time() + deadline_min * 60 if deadline_min else None
+    months = {}
+    def month_key(d): return d.strftime('%Y-%m')
+    def load_month(k):
+        if k not in months: months[k] = jload(os.path.join(folder, k + '.json'), {})
+        return months[k]
+    # day list, newest first
+    days = []; d = today
+    while d >= NSE_START:
+        if d.weekday() < 5: days.append(d)
+        d -= dt.timedelta(days=1)
+    todo = [d for d in days if d.isoformat() not in load_month(month_key(d)) and d.isoformat() not in hol]
+    STATUS.update(total=len(todo), done=0, msg='Downloading NSE daily files…'); got = 0; errors = []; consec = 0
+    def work(d):
+        if t_end and time.time() > t_end: return d, 'late'
+        try: return d, fetch_day(d, wanted)
+        except Exception as e: return d, ('err', str(e)[:120])
+    CH = 40
+    for i in range(0, len(todo), CH):
+        chunk = todo[i:i + CH]
+        with ThreadPoolExecutor(max_workers=4) as ex: res = list(ex.map(work, chunk))
+        for d, r in res:
+            STATUS['done'] += 1; k = month_key(d)
+            if r == 'late': continue
+            if isinstance(r, tuple): errors.append((d, r[1])); consec += 1; continue
+            consec = 0
+            if r is None:
+                if (today - d).days > 3: hol.add(d.isoformat())
+                continue
+            load_month(k)[d.isoformat()] = r; got += 1
+        for k in {month_key(d) for d in chunk}: jsave(os.path.join(folder, k + '.json'), months[k])
+        jsave(hol_path, sorted(hol))
+        if consec >= 12: log('NSE keeps failing:', errors[-1]); break
+        if t_end and time.time() > t_end: log('Time limit reached; history will deepen on the next run'); break
+    # assemble
+    alld = {}
+    for f in sorted(os.listdir(folder)):
+        if f.endswith('.json') and not f.startswith('_'): alld.update(jload(os.path.join(folder, f), {}))
+    dates = sorted(alld)
+    if len(dates) < 120:
+        why = errors[0][1] if errors else 'no files could be read'
+        raise RuntimeError(f'Only {len(dates)} trading days of NSE history are available so far ({why}). NSE may be blocking this server. Run again later.')
+    nb = {'d': [], 'o': [], 'h': [], 'l': [], 'c': [], 'v': []}; vb = {'d': [], 'o': [], 'h': [], 'l': [], 'c': [], 'v': []}
+    per = {}
+    for dd in dates:
+        rec = alld[dd]
+        if rec.get('n'):
+            for k, v in zip('ohlc', rec['n']): nb[k].append(v)
+            nb['d'].append(dd); nb['v'].append(0)
+        if rec.get('v'):
+            vb['d'].append(dd)
+            for k in 'ohlc': vb[k].append(rec['v'])
+            vb['v'].append(0)
+        for sym, v in rec['s'].items(): per.setdefault(sym, []).append((dd, v))
+    if len(nb['d']) < 120: raise RuntimeError('The NSE index files for the Nifty could not be read (only %d days).' % len(nb['d']))
+    bars = {}; failed = []; adj = 0
+    for sym in uni:
+        rows = per.get(sym)
+        if not rows or len(rows) < 30: failed.append((sym, 'no NSE price history')); continue
+        # splits and bonuses: NSE's "previous close" is already adjusted, so a gap against yesterday's close marks one; scale the older prices
+        fac = 1.0; n = len(rows); o = [0.0] * n; h = [0.0] * n; l = [0.0] * n; c = [0.0] * n; v = [0] * n
+        for i in range(n - 1, -1, -1):
+            if i < n - 1:
+                pc = rows[i + 1][1][4]; cl = rows[i][1][3]
+                if cl > 0 and pc > 0 and abs(pc / cl - 1) > 0.04: fac *= pc / cl; adj += 1
+            r = rows[i][1]; o[i], h[i], l[i], c[i] = (round(x * fac, 3) for x in r[:4]); v[i] = int(r[5] / fac) if fac > 0 else r[5]
+        bars[sym] = {'d': [x[0] for x in rows], 'o': o, 'h': h, 'l': l, 'c': c, 'v': v}
+    info = f"{len(dates)} trading days from {dates[0]} to {dates[-1]}; {adj} split/bonus adjustments; {len(bars)} of {len(uni)} stocks have history"
+    if not bars: raise RuntimeError('No stock history could be built from the NSE files.')
+    return bars, nb, (vb if len(vb['d']) > 60 else None), failed, info
+
 def collect_trades(strat):
     """Every trade the rules would have taken, over the whole history, before costs or position limits.
     The phone version downloads this list and does the cost / risk / date maths in the browser."""
@@ -412,34 +523,42 @@ def refresh():
         if not uni: raise RuntimeError('Could not get the stock lists from NSE, and none are saved from before. ' + '; '.join(uerr))
         syms = list(uni.keys()); STATUS.update(total=len(syms) + 2, msg='Downloading prices…', abort=False)
         deadline = time.time() + BUDGET_MIN * 60 if BUDGET_MIN else None
-        # The Nifty index comes first. Without it nothing else can be worked out, so fail early and clearly.
-        nb = None; last_err = None
-        for attempt in range(3):
-            try: nb = get_bars('NIFTY')[0]; break
-            except Exception as e:
-                last_err = e; log('Nifty download failed:', e)
-                if attempt < 2: time.sleep(30)
-        if nb is None: raise RuntimeError('Yahoo Finance refused the request for the Nifty index (' + str(last_err)[:100] + '). If this runs on GitHub, Yahoo is probably blocking GitHub\'s servers.')
-        try: vb = get_bars('VIX')[0]
-        except Exception: vb = None
-        run = {'consec': 0}
-        def one(s):
-            if STATUS.get('abort'): return s, None, 'skipped: Yahoo is refusing requests'
-            if deadline and time.time() > deadline: return s, None, 'skipped: time limit reached, will continue next run'
-            try: b, mode = get_bars(s); return s, b, None
-            except Exception as e: return s, None, str(e)[:120]
-        bars = {}
-        with ThreadPoolExecutor(max_workers=2 if not MOCK else 8) as ex:
-            for s, b, err in ex.map(one, syms):
-                STATUS['done'] += 1
-                if b and len(b['d']) > 0: bars[s] = b; run['consec'] = 0
-                else:
-                    failed.append((s, err))
-                    if err and '429' in err:
-                        run['consec'] += 1
-                        if run['consec'] >= 12: STATUS['abort'] = True
-                time.sleep(0.3 if not MOCK else 0)
-        if len(bars) < 20: raise RuntimeError(f'Only {len(bars)} stocks could be downloaded. Yahoo Finance is refusing most requests (' + (failed[0][1] if failed else 'unknown') + ').')
+        def yahoo_load():
+            # The Nifty index comes first. Without it nothing else can be worked out, so fail early and clearly.
+            nb = None; last_err = None
+            for attempt in range(3):
+                try: nb = get_bars('NIFTY')[0]; break
+                except Exception as e:
+                    last_err = e; log('Nifty download failed:', e)
+                    if attempt < 2: time.sleep(30)
+            if nb is None: raise RuntimeError('Yahoo Finance refused the request for the Nifty index (' + str(last_err)[:100] + '). If this runs on GitHub, Yahoo is probably blocking GitHub\'s servers.')
+            try: vb = get_bars('VIX')[0]
+            except Exception: vb = None
+            run = {'consec': 0}
+            def one(s):
+                if STATUS.get('abort'): return s, None, 'skipped: Yahoo is refusing requests'
+                if deadline and time.time() > deadline: return s, None, 'skipped: time limit reached, will continue next run'
+                try: b, mode = get_bars(s); return s, b, None
+                except Exception as e: return s, None, str(e)[:120]
+            bars = {}
+            with ThreadPoolExecutor(max_workers=2 if not MOCK else 8) as ex:
+                for s, b, err in ex.map(one, syms):
+                    STATUS['done'] += 1
+                    if b and len(b['d']) > 0: bars[s] = b; run['consec'] = 0
+                    else:
+                        failed.append((s, err))
+                        if err and '429' in err:
+                            run['consec'] += 1
+                            if run['consec'] >= 12: STATUS['abort'] = True
+                    time.sleep(0.3 if not MOCK else 0)
+            if len(bars) < 20: raise RuntimeError(f'Only {len(bars)} stocks could be downloaded. Yahoo Finance is refusing most requests (' + (failed[0][1] if failed else 'unknown') + ').')
+            return bars, nb, vb, failed
+
+        info = ''
+        if USE_NSE:
+            bars, nb, vb, failed, info = nse_load(uni, deadline_min=BUDGET_MIN)
+        else:
+            bars, nb, vb, failed = yahoo_load()
         STATUS.update(msg='Working out ideas…')
         asof = nb['d'][-1]; ni = prep(nb); inds = {s: prep(b) for s, b in bars.items()}
         regs = regime_series(nb, ni, vb); ri, vix = regs[asof]
@@ -451,9 +570,9 @@ def refresh():
         for k in ('brk', 'pb', 'mr'):
             r = backtest({'strat': k, 'from': 2017, 'to': 2024, 'uni': 'all'}); tested[k] = round(r.get('exp', 0), 3)
         # source checks
-        nse_chk = cross_check(bars, asof); tz = now().strftime('%d %b, %H:%M')
+        nse_chk = cross_check(bars, asof) if not USE_NSE else {'ok': True, 'n': len(bars), 'text': info, 'mismatch': [], 'date': asof}; tz = now().strftime('%d %b, %H:%M')
         H = {'nse_eod': ['good' if nse_chk['ok'] else 'warn', 'Healthy' if nse_chk['ok'] else 'Unavailable' if nse_chk['n'] == 0 else 'Check', tz, nse_chk['text']] if not MOCK else ['off', 'Mock', tz, 'Mock mode'],
-             'yahoo': ['good' if len(failed) < 0.05 * len(syms) else 'warn', 'Healthy' if len(failed) < 0.05 * len(syms) else 'Partial', tz, f'{len(bars)} of {len(syms)} stocks downloaded' + (f', {len(failed)} failed' if failed else '')],
+             'yahoo': (['off', 'Not used', '—', 'Yahoo blocks GitHub servers, so NSE daily files are used'] if USE_NSE else ['good' if len(failed) < 0.05 * len(syms) else 'warn', 'Healthy' if len(failed) < 0.05 * len(syms) else 'Partial', tz, f'{len(bars)} of {len(syms)} stocks downloaded' + (f', {len(failed)} failed' if failed else '')]),
              'nse_ann': ['off', 'Not built yet', '—', 'Results dates and corporate announcements are not read yet'], 'rss': ['off', 'Not built yet', '—', 'News headlines are not read yet'],
              'gdelt': ['off', 'Not built yet', '—', 'Planned'], 'rbi': ['off', 'Not built yet', '—', 'Planned'], 'screener': ['off', 'Off', 'never', 'Terms not yet confirmed']}
         age = (now().date() - dt.date.fromisoformat(asof)).days

@@ -15,7 +15,18 @@ probe('Yahoo (query1)', 'https://query1.finance.yahoo.com/v8/finance/chart/RELIA
 probe('Yahoo (query2)', 'https://query2.finance.yahoo.com/v8/finance/chart/RELIANCE.NS?range=5d&interval=1d')
 probe('NSE index list', s.UNI_URLS['Large'][0])
 probe('niftyindices list', s.UNI_URLS['Large'][1])
+import datetime as _dt
+d = _dt.date.today() - _dt.timedelta(days=3); tried = 0
+while tried < 5:
+    if d.weekday() < 5:
+        tried += 1
+        try: s.http_get(s.bhav_url(d), tries=1, timeout=30); print('PROBE ok      NSE daily price file', d); break
+        except Exception as e: print('PROBE no      NSE daily price file', d, '->', str(e)[:60])
+    d -= _dt.timedelta(days=1)
+try: s.http_get(s.idx_url(d), tries=1, timeout=30); print('PROBE ok      NSE daily index file', d)
+except Exception as e: print('PROBE no      NSE daily index file', d, '->', str(e)[:60])
 print('---')
+s.USE_NSE = True            # Yahoo blocks GitHub's servers, so use NSE's own daily files
 s.refresh()
 st = s.CACHE.get('state')
 if not st or s.STATUS['msg'].startswith('Failed'):
