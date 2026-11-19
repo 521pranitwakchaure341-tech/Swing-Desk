@@ -6,6 +6,16 @@ import server as s
 ROOT = os.path.dirname(os.path.abspath(__file__))
 s.DATA = os.path.join(ROOT, 'data'); s.PRICES = os.path.join(s.DATA, 'prices'); os.makedirs(s.PRICES, exist_ok=True)
 DOCS = ROOT
+s.BUDGET_MIN = 75
+def probe(name, url):
+    try: s.http_get(url, tries=1, timeout=20); print('PROBE ok     ', name)
+    except Exception as e: print('PROBE blocked', name, '->', str(e)[:80])
+print('--- Which sources can this server reach? ---')
+probe('Yahoo (query1)', 'https://query1.finance.yahoo.com/v8/finance/chart/RELIANCE.NS?range=5d&interval=1d')
+probe('Yahoo (query2)', 'https://query2.finance.yahoo.com/v8/finance/chart/RELIANCE.NS?range=5d&interval=1d')
+probe('NSE index list', s.UNI_URLS['Large'][0])
+probe('niftyindices list', s.UNI_URLS['Large'][1])
+print('---')
 s.refresh()
 st = s.CACHE.get('state')
 if not st or s.STATUS['msg'].startswith('Failed'):

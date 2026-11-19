@@ -27,6 +27,7 @@ UNI_URLS = {
     'Mid':   ['https://archives.nseindia.com/content/indices/ind_niftymidcap150list.csv', 'https://www.niftyindices.com/IndexConstituent/ind_niftymidcap150list.csv'],
     'Small': ['https://archives.nseindia.com/content/indices/ind_niftysmallcap250list.csv', 'https://www.niftyindices.com/IndexConstituent/ind_niftysmallcap250list.csv']}
 STRAT_WK = {'brk': 6, 'pb': 3, 'mr': 2}
+BUDGET_MIN = None                                   # set by the phone build: stop downloading after this many minutes and carry on next run
 LOCK = threading.Lock()
 STATUS = {'running': False, 'msg': 'Idle', 'done': 0, 'total': 0}
 CACHE = {'state': None, 'ind': {}, 'bars': {}, 'meta': {}, 'nifty': None, 'vix': None}
@@ -46,12 +47,13 @@ def http_get(url, tries=3, timeout=25, headers=None):
     last = None
     for k in range(tries):
         try:
-            req = urllib.request.Request(url, headers=dict(UA, **(headers or {})))
+            u = url.replace('query1.finance.yahoo.com', 'query2.finance.yahoo.com') if k % 2 and 'query1.finance.yahoo.com' in url else url   # try Yahoo's second address too
+            req = urllib.request.Request(u, headers=dict(UA, **(headers or {})))
             with urllib.request.urlopen(req, timeout=timeout) as r: return r.read()
         except urllib.error.HTTPError as e:
             last = e
             if e.code in (404, 403): break
-            time.sleep(1.5 * (k + 1) + (3 if e.code == 429 else 0))
+            time.sleep(10 * (k + 1) if e.code == 429 else 1.5 * (k + 1))
         except Exception as e:
             last = e; time.sleep(1.5 * (k + 1))
     raise last
@@ -408,23 +410,36 @@ def refresh():
         t0 = time.time(); inbox, failed = [], []
         uni, uerr, cached = load_universe()
         if not uni: raise RuntimeError('Could not get the stock lists from NSE, and none are saved from before. ' + '; '.join(uerr))
-        syms = list(uni.keys()); STATUS.update(total=len(syms) + 2, msg='Downloading prices…')
+        syms = list(uni.keys()); STATUS.update(total=len(syms) + 2, msg='Downloading prices…', abort=False)
+        deadline = time.time() + BUDGET_MIN * 60 if BUDGET_MIN else None
+        # The Nifty index comes first. Without it nothing else can be worked out, so fail early and clearly.
+        nb = None; last_err = None
+        for attempt in range(3):
+            try: nb = get_bars('NIFTY')[0]; break
+            except Exception as e:
+                last_err = e; log('Nifty download failed:', e)
+                if attempt < 2: time.sleep(30)
+        if nb is None: raise RuntimeError('Yahoo Finance refused the request for the Nifty index (' + str(last_err)[:100] + '). If this runs on GitHub, Yahoo is probably blocking GitHub\'s servers.')
+        try: vb = get_bars('VIX')[0]
+        except Exception: vb = None
+        run = {'consec': 0}
         def one(s):
+            if STATUS.get('abort'): return s, None, 'skipped: Yahoo is refusing requests'
+            if deadline and time.time() > deadline: return s, None, 'skipped: time limit reached, will continue next run'
             try: b, mode = get_bars(s); return s, b, None
             except Exception as e: return s, None, str(e)[:120]
         bars = {}
-        def tick(r):
-            STATUS['done'] += 1
         with ThreadPoolExecutor(max_workers=2 if not MOCK else 8) as ex:
-            nb_f, vb_f = ex.submit(lambda: (lambda b: b)(get_bars('NIFTY')[0])), ex.submit(lambda: get_bars('VIX')[0])
             for s, b, err in ex.map(one, syms):
                 STATUS['done'] += 1
-                if b and len(b['d']) > 0: bars[s] = b
-                else: failed.append((s, err))
-                time.sleep(0.05 if not MOCK else 0)
-            nb = nb_f.result()
-            try: vb = vb_f.result()
-            except Exception: vb = None
+                if b and len(b['d']) > 0: bars[s] = b; run['consec'] = 0
+                else:
+                    failed.append((s, err))
+                    if err and '429' in err:
+                        run['consec'] += 1
+                        if run['consec'] >= 12: STATUS['abort'] = True
+                time.sleep(0.3 if not MOCK else 0)
+        if len(bars) < 20: raise RuntimeError(f'Only {len(bars)} stocks could be downloaded. Yahoo Finance is refusing most requests (' + (failed[0][1] if failed else 'unknown') + ').')
         STATUS.update(msg='Working out ideas…')
         asof = nb['d'][-1]; ni = prep(nb); inds = {s: prep(b) for s, b in bars.items()}
         regs = regime_series(nb, ni, vb); ri, vix = regs[asof]
