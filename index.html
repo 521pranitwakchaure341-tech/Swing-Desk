@@ -683,7 +683,7 @@ function labResultHtml(res, title, tag) {
     <div class="note">${esc(res.note || '')}</div>
     <div class="grid kpis" style="margin-top:10px">${t('Trades', res.n)}${t('Win rate', res.win.toFixed(0) + '%', 'avg win ' + res.avgW.toFixed(2) + 'R · loss ' + res.avgL.toFixed(2) + 'R')}${t('Expectancy', (res.exp >= 0 ? '+' : '−') + Math.abs(res.exp).toFixed(2) + 'R', 'after costs', cls(res.exp))}${t('Profit factor', res.pf.toFixed(2))}${t('Max drawdown', res.dd.toFixed(1) + '%')}${t('Return', sgn(res.ret), 'Nifty ' + sgn(res.nifty), cls(res.ret))}</div>
     ${flags.length ? `<ul class="why" style="margin-top:8px;color:var(--warn-text)">${flags.map(f => `<li>${esc(f)}</li>`).join('')}</ul>` : ''}
-    <div id="labEq" style="margin-top:10px"></div>
+    ${stressHtml(res)}<div id="labEq" style="margin-top:10px"></div>
     <h3 style="margin:12px 0 6px">By year</h3><div class="tblw"><table><thead><tr><th>Year</th><th class="r">Trades</th><th class="r">Win rate</th><th class="r">Expectancy</th><th class="r">Return</th></tr></thead><tbody>${res.years.map(y => `<tr><td>${y.y}</td><td class="r">${y.n}</td><td class="r">${y.win.toFixed(0)}%</td><td class="r ${cls(y.exp)}">${y.exp >= 0 ? '+' : '−'}${Math.abs(y.exp).toFixed(2)}R</td><td class="r ${cls(y.ret)}">${sgn(y.ret)}</td></tr>`).join('')}</tbody></table></div></div>`;
 }
 function viewLab() {
@@ -993,8 +993,8 @@ async function simStatic(p, final) {
   const days = [...byDay.keys()].sort(); let open = []; const tr = [];
   for (const d of days) {
     open = open.filter(x => x > d);
-    const arr = byDay.get(d).map(t => ({ sc: t[3], xd: t[2], nr: t[4] - ce / t[5] })).sort((a, b) => b.sc - a.sc || (a.xd < b.xd ? 1 : a.xd > b.xd ? -1 : 0) || b.nr - a.nr);
-    for (const t of arr) { if (open.length >= 9) break; open.push(t.xd); tr.push({ xd: t.xd, nr: t.nr, ed: d }); }
+    const arr = byDay.get(d).map(t => ({ sc: t[3], xd: t[2], nr: t[4] - ce / t[5], sp: t[5], sg: t[6] })).sort((a, b) => b.sc - a.sc || (a.xd < b.xd ? 1 : a.xd > b.xd ? -1 : 0) || b.nr - a.nr);
+    for (const t of arr) { if (open.length >= 9) break; open.push(t.xd); tr.push({ xd: t.xd, nr: t.nr, ed: d, sp: t.sp, sg: t.sg }); }
   }
   if (!tr.length) { if (m) m.textContent = 'No trades matched the rules in that period.'; return null; }
   tr.sort((a, b) => (a.xd < b.xd ? -1 : a.xd > b.xd ? 1 : a.nr - b.nr));
@@ -1007,7 +1007,12 @@ async function simStatic(p, final) {
   const nclose = d => { let lo = 0, hi = nd.length - 1, r = 0; while (lo <= hi) { const mid = (lo + hi) >> 1; if (nd[mid] <= d) { r = mid; lo = mid + 1; } else hi = mid - 1; } return nc[r]; };
   const base = nclose(dates[0]), nfs = dates.map(d => nclose(d) / base * 100), n = tr.length;
   const years = Object.keys(yrs).sort().map(y => ({ y: +y, n: yrs[y].n, win: yrs[y].w / yrs[y].n * 100, exp: yrs[y].R / yrs[y].n, ret: (yrs[y].e / yrs[y].s - 1) * 100 }));
-  return { n, win: w / n * 100, avgW: w ? sw / w : 0, avgL: cl ? -sl / cl : 0, exp: tr.reduce((a, t) => a + t.nr, 0) / n, pf: sl ? sw / sl : 99, dd: dd * 100, ret: (eq / 100 - 1) * 100, nifty: (nfs[nfs.length - 1] / 100 - 1) * 100, years, eqs, nfs, dates: dates.map(toD), trades: [],
+  const mean = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0, nrs = tr.map(t => t.nr), top = [...nrs].sort((a, b) => b - a);
+  let cur = 0, streak = 0; for (const t of tr) { if (t.nr <= 0) { cur++; streak = Math.max(streak, cur); } else cur = 0; }
+  const stress = n >= 20 ? { ex5: mean(top.slice(5)), cost2: mean(tr.map(t => t.nr - ce / t.sp)), surv: 0.97 * mean(nrs) + 0.03 * -2, streak,
+    worst: years.reduce((a, y) => y.ret < a.ret ? y : a, years[0]), h1: mean(nrs.slice(0, n >> 1)), h2: mean(nrs.slice(n >> 1)),
+    seg: ['Large', 'Mid', 'Small'].map((nm, k) => { const a = tr.filter(t => t.sg === k).map(t => t.nr); return { nm, n: a.length, exp: mean(a) }; }).filter(x => x.n) } : null;
+  return { stress, n, win: w / n * 100, avgW: w ? sw / w : 0, avgL: cl ? -sl / cl : 0, exp: tr.reduce((a, t) => a + t.nr, 0) / n, pf: sl ? sw / sl : 99, dd: dd * 100, ret: (eq / 100 - 1) * 100, nifty: (nfs[nfs.length - 1] / 100 - 1) * 100, years, eqs, nfs, dates: dates.map(toD), trades: [],
     posYears: years.filter(y => y.ret > 0).length / years.length, note: "Uses today's index members, so stocks that dropped out or were delisted are missing (survivorship bias). Results are flattering. Daily prices only, no intraday detail." };
 }
 /* ----- phone version: Claude (Haiku) called straight from this phone with a key that never leaves it ----- */
@@ -1036,9 +1041,10 @@ if (STATIC) {
 /* ---- results-date banner and headlines on idea cards ---- */
 (function () { try { const st = document.createElement('style'); st.textContent = '.evb{margin:8px 0;padding:8px 10px;border-radius:8px;font-size:12.5px;line-height:1.4;border:1px solid var(--line);background:var(--surface2,var(--surface));color:var(--ink2)}.evb.warn{border-color:var(--warn-text,#b45309);color:var(--warn-text,#b45309)}.evb b{font-weight:600}.news{margin:8px 0 6px;padding:0;list-style:none;font-size:12.5px}.news li{margin:3px 0;color:var(--ink2)}.news a{color:inherit;text-decoration:underline}.news .nf{color:var(--crit);font-weight:600}.news small{opacity:.75}'; document.head.appendChild(st); } catch (e) { } })();
 function evHtml(d) {
-  const e = d.ev; if (!e) return '';
+  const nw = d.new ? '<div class="evb"><b>New today.</b> It was not in yesterday\'s list.</div>' : '';
+  const e = d.ev; if (!e) return nw;
   const lab = e.lvl === 'warn' ? 'Results risk. ' : e.lvl === 'unk' ? 'Not checked. ' : e.lvl === 'ok' ? 'Results. ' : 'Results. ';
-  return `<div class="evb ${e.lvl === 'warn' || e.lvl === 'unk' ? 'warn' : ''}"><b>${lab}</b>${esc(e.text)}</div>`;
+  return nw + `<div class="evb ${e.lvl === 'warn' || e.lvl === 'unk' ? 'warn' : ''}"><b>${lab}</b>${esc(e.text)}${e.src === 'news' ? ' <i>(inferred from headlines)</i>' : ''}</div>`;
 }
 function newsHtml(d) {
   if (d.news === undefined) return '';
@@ -1084,6 +1090,20 @@ AFTER.ideas = function () {
   g.insertAdjacentHTML('beforebegin', '<div class="note" id="njst">' + esc(njReady() ? (IDEAS.every(i => !(i.news && i.news.length) || NJ_CUR[i.t]) ? 'Claude has read the headlines. It sees the headline text only, not the articles, so it can be wrong.' : 'Claude is reading the headlines…') : 'Turn Claude on in Preferences (and add your key) and it will judge each idea\'s headlines as good, bad or mixed.') + '</div>');
   judgeNews();
 };
+
+/* ---- reality check shown under Lab results ---- */
+function stressHtml(res) {
+  const z = res.stress; if (!z) return '';
+  const R = v => (v >= 0 ? '+' : '−') + Math.abs(v).toFixed(2) + 'R', c = v => v > 0 ? 'up' : 'dn';
+  const tests = [['Without its 5 best trades', z.ex5, 'Shows whether a few lucky trades carry the result.'], ['If trading costs were double', z.cost2, 'Real costs vary; this checks the edge is not paper-thin.'],
+    ['If 3 in 100 trades were stocks that later collapsed (−2R)', z.surv, 'A rough guess at the survivorship problem. The real size is unknown.'], ['First half of the period', z.h1, ''], ['Second half of the period', z.h2, '']];
+  const fails = tests.filter(t => t[1] <= 0).length;
+  const verdict = fails === 0 ? 'Still positive under every stress below. That is encouraging, not proof.' : `Fails ${fails} of ${tests.length} stresses. Treat the headline result with suspicion.`;
+  return `<h3 style="margin:12px 0 6px">Reality check</h3><div class="evb ${fails ? 'warn' : ''}"><b>${verdict}</b></div>
+  <div class="tblw"><table><thead><tr><th>Test</th><th class="r">Average per trade</th></tr></thead><tbody>${tests.map(t => `<tr><td>${esc(t[0])}${t[2] ? `<br><small class="sub">${esc(t[2])}</small>` : ''}</td><td class="r ${c(t[1])}">${R(t[1])}</td></tr>`).join('')}</tbody></table></div>
+  <p class="sub" style="margin:6px 0">Worst year: ${z.worst.y} (${z.worst.ret >= 0 ? '+' : '−'}${Math.abs(z.worst.ret).toFixed(1)}%). Longest losing streak: ${z.streak} trades in a row.</p>
+  <div class="tblw"><table><thead><tr><th>Size of company</th><th class="r">Trades</th><th class="r">Average per trade</th></tr></thead><tbody>${z.seg.map(x => `<tr><td>${x.nm} cap</td><td class="r">${x.n}</td><td class="r ${c(x.exp)}">${R(x.exp)}</td></tr>`).join('')}</tbody></table></div>`;
+}
 
 (function boot() {
   try { const t = localStorage.getItem('swingdesk-theme'); if (t) { S.settings.theme = t; applyTheme(); } } catch (e) {}

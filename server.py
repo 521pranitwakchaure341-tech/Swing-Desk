@@ -300,6 +300,88 @@ def event_info(sym, today, wk):
         return {'lvl': 'ok', 'd': d.isoformat(), 'n': n, 'text': 'Results due %s (in %d days), after the likely holding period.' % (d.strftime('%d %b'), n)}
     if in_results_season(today): return {'lvl': 'warn', 'text': 'No results date announced yet, but it is results season. Companies announce the date only about a week ahead, so check before acting.', 'season': True}
     return {'lvl': 'none', 'text': 'No results date on the NSE calendar yet.'}
+
+SERIES_X = {}                       # stocks NSE shows outside the normal EQ series on the latest days (trade-to-trade = surveillance)
+SECTORS = {}                        # sector -> {'ret': median 3-month return %, 'rank': 1 = strongest, 'of': number of sectors}
+FLOWS = None                        # {'fii': net crore, 'dii': net crore, 'date': text} when NSE answers
+def compute_sectors(uni, bars):
+    by = {}
+    for sym, b in bars.items():
+        sec = (uni.get(sym) or {}).get('sec')
+        if not sec or len(b['c']) < 70 or b['c'][-64] <= 0: continue
+        by.setdefault(sec, []).append((b['c'][-1] / b['c'][-64] - 1) * 100)
+    rows = []
+    for sec, v in by.items():
+        if len(v) >= 5: v.sort(); rows.append((sec, v[len(v) // 2]))
+    rows.sort(key=lambda x: -x[1]); SECTORS.clear()
+    for k, (sec, r) in enumerate(rows): SECTORS[sec] = {'ret': round(r, 1), 'rank': k + 1, 'of': len(rows)}
+def fetch_flows():
+    op = _nse_open(); j = _nse_json(op, 'https://www.nseindia.com/api/fiidiiTradeReact'); out = {}
+    for r in (j if isinstance(j, list) else []):
+        cat = str(r.get('category', '')).upper()
+        try: net = float(str(r.get('netValue', '')).replace(',', ''))
+        except Exception: continue
+        if cat.startswith('FII'): out['fii'] = net
+        elif cat.startswith('DII'): out['dii'] = net
+        out['date'] = str(r.get('date', ''))
+    return out if 'fii' in out or 'dii' in out else None
+_MON = 'jan feb mar apr may jun jul aug sep oct nov dec'.split()
+RES_RE = re.compile(r'\b(q[1-4]\s*(fy\s*\d{2,4})?\s*(results?|earnings|profit|net profit)|quarterly (results?|earnings|profit)|(net )?profit (rises?|jumps?|surges?|soars?|falls?|declines?|slips?|drops?|dips?|up|down)|results? (today|out)|(reports?|posts?) (q[1-4]|net profit|profit))\b', re.I)
+UPC_RE = re.compile(r'(board meeting|to announce|to declare|to consider|will announce|results? (on|date)|to report)', re.I)
+DATE_RE = re.compile(r'\b(\d{1,2})(?:st|nd|rd|th)?\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b|\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?\b', re.I)
+def _title_date(t, today):
+    m = DATE_RE.search(t)
+    if not m: return None
+    day = int(m.group(1) or m.group(4)); mon = _MON.index((m.group(2) or m.group(3)).lower()) + 1
+    for yr in (today.year, today.year + 1):
+        try: d = dt.date(yr, mon, day)
+        except ValueError: return None
+        if d >= today - dt.timedelta(days=45): return d
+    return None
+def news_results(name, sym, today):
+    """Rough substitute for the NSE calendar: looks for 'results on <date>' or 'Q2 profit rises' style headlines. Returns an ev dict or None."""
+    key = _clean_name(name) or sym; first = key.split()[0].lower() if key.split() else sym.lower()
+    q = urllib.parse.quote('"%s" (results OR "board meeting" OR earnings) when:45d' % key)
+    root = ET.fromstring(http_get('https://news.google.com/rss/search?q=%s&hl=en-IN&gl=IN&ceid=IN:en' % q, tries=2, timeout=20))
+    upcoming = None; reported = None
+    for it in root.findall('./channel/item'):
+        t = (it.findtext('title') or '').strip()
+        if first not in t.lower() and sym.lower() not in t.lower(): continue
+        pdx = it.findtext('pubDate'); pd = _parse_date(re.sub(r'^\w{3}, ', '', pdx)) if pdx else None
+        if UPC_RE.search(t):
+            d = _title_date(t, today)
+            if d and d >= today - dt.timedelta(days=1) and (upcoming is None or d < upcoming[0]): upcoming = (d, t)
+        elif RES_RE.search(t) and pd and 0 <= (today - pd).days <= 45:
+            if reported is None or pd > reported[0]: reported = (pd, t)
+    if upcoming:
+        d, t = upcoming; n = (d - today).days
+        if n <= 7: return {'lvl': 'veto', 'd': d.isoformat(), 'n': n, 'src': 'news', 'text': 'A headline says results or a board meeting are due about %s (in %d days; not an official date). Results can move a stock 5–10%% overnight, so it is skipped.' % (d.strftime('%d %b'), max(n, 0))}
+        return {'lvl': 'warn' if n <= 28 else 'ok', 'd': d.isoformat(), 'n': n, 'src': 'news', 'text': 'A headline says results are due about %s (in %d days; not an official date).' % (d.strftime('%d %b'), n)}
+    if reported: return {'lvl': 'ok', 'src': 'news', 'text': 'Headlines show it reported results around %s, so the next ones are about three months away (inferred from news, not official).' % reported[0].strftime('%d %b')}
+    return None
+def apply_news_events(ideas, vetoed):
+    """Where the NSE calendar gave no answer, try headlines. Returns (ideas kept, worked, tried)."""
+    today = now().date(); keep = []; tried = worked = 0; cache = {}; dead = False
+    for i in ideas:
+        e = i.get('ev') or {}
+        if dead or e.get('lvl') in ('veto',) or (e.get('lvl') in ('ok', 'warn') and not e.get('season') and not e.get('src')):
+            keep.append(i); continue
+        if i['t'] not in cache:
+            tried += 1
+            try: cache[i['t']] = news_results(i['n'], i['t'], today); worked += 1
+            except Exception as ex: cache[i['t']] = None; log('Results-from-news failed for', i['t'], str(ex)[:60])
+            time.sleep(0.4)
+            if tried >= 6 and worked == 0: dead = True
+        ne = cache[i['t']]
+        if not ne: keep.append(i); continue
+        if ne['lvl'] == 'veto':
+            if not any(v['t'] == i['t'] for v in vetoed): vetoed.append({'t': i['t'], 'n': i['n'], 'why': ne['text']})
+            continue
+        i['ev'] = ne
+        if ne['lvl'] == 'warn' and i['tier'] == 1: i['tier'] = 2
+        keep.append(i)
+    return keep, worked, tried
+
 def _clean_name(n):
     n = re.sub(r'\(.*?\)', '', n or ''); n = re.sub(r'\b(limited|ltd\.?|corporation|corp\.?|industries|india)\b', '', n, flags=re.I)
     return re.sub(r'\s+', ' ', n).strip()
@@ -347,6 +429,9 @@ def build_ideas(uni, bars, inds, regimes, nb, asof):
             if not s: continue
             vr = veto_reason(meta, b, ind, i, asof)
             if vr: vetoed.append({'t': sym, 'n': meta['name'], 'why': vr}); continue
+            if sym in SERIES_X:
+                if sym not in ev_vetoed: ev_vetoed.add(sym); vetoed.append({'t': sym, 'n': meta['name'], 'why': "Now trading in NSE's %s series (trade-to-trade), usually a sign of exchange surveillance. Exits can be slow, so it is skipped." % SERIES_X[sym]})
+                continue
             evi = event_info(sym, now().date(), s['wk'])
             if evi['lvl'] == 'veto':
                 if sym not in ev_vetoed: ev_vetoed.add(sym); vetoed.append({'t': sym, 'n': meta['name'], 'why': evi['text']})
@@ -359,10 +444,19 @@ def build_ideas(uni, bars, inds, regimes, nb, asof):
             (good if s['rs'] > 0 else bad).append('Beating the Nifty over 3 months')
             (good if s['tv'] >= 2 * MIN_TV_CR[meta['seg']] else bad).append('Comfortably liquid')
             (good if s['rr'] >= 2 else bad).append('Reward at least 2x the risk')
+            dpa = b.get('dp') or []; dps = [x for x in dpa[-21:-1] if x is not None]; dlast = dpa[-1] if dpa else None
+            if dlast is not None and len(dps) >= 8:
+                dav = sum(dps) / len(dps)
+                if dlast >= max(35, dav * 1.15): good.append('Delivery %.0f%% vs %.0f%% usual (more real buying)' % (dlast, dav))
+                elif dlast <= dav * 0.75 and st != 'mr': bad.append('Delivery only %.0f%% vs %.0f%% usual (mostly day-trading)' % (dlast, dav))
+            sc_ = SECTORS.get(meta['sec'])
+            if sc_ and st != 'mr':
+                if sc_['rank'] <= max(1, sc_['of'] // 3): good.append('Sector strong: %s ranks %d of %d' % (meta['sec'], sc_['rank'], sc_['of']))
+                elif sc_['rank'] > sc_['of'] - sc_['of'] // 3: bad.append('Sector weak: %s ranks %d of %d' % (meta['sec'], sc_['rank'], sc_['of']))
             if tier == 1 and (not s['trend'] or len(bad) > 1 or evi['lvl'] == 'warn'): tier = 2
             why = s['why'] + [f"{s['rs']:+.1f}% against the Nifty over 3 months; average daily traded value ₹{s['tv']:.1f} crore"]
             ideas.append({'t': sym, 'n': meta['name'], 'sec': meta['sec'] or '—', 'seg': meta['seg'], 'st': st, 'tier': tier, 'entry': s['entry'], 'stop': s['stop'], 'target': s['target'], 'wk': s['wk'],
-                          'ev': evi, 'score': s['score'], 'vol': f"{s['vr']:.1f}x", 'rs': f"{s['rs']:+.1f}%".replace('-', '−'), 'why': why, 'chk': good, 'bad': bad})
+                          'ev': evi, 'dp': dlast, 'secrank': ([sc_['rank'], sc_['of']] if sc_ else None), 'score': s['score'], 'vol': f"{s['vr']:.1f}x", 'rs': f"{s['rs']:+.1f}%".replace('-', '−'), 'why': why, 'chk': good, 'bad': bad})
     ideas.sort(key=lambda x: (x['tier'], -x['score']))
     return ideas[:24], vetoed[:40], skipped
 
@@ -496,14 +590,17 @@ def fetch_day(d, wanted):
     rows = csv.reader(io.StringIO(raw)); hdr = [h.strip().upper() for h in next(rows)]; ix = {h: i for i, h in enumerate(hdr)}
     need = ('SYMBOL', 'SERIES', 'PREV_CLOSE', 'OPEN_PRICE', 'HIGH_PRICE', 'LOW_PRICE', 'CLOSE_PRICE', 'TTL_TRD_QNTY')
     if any(k not in ix for k in need): raise RuntimeError('The NSE price file has a new layout: ' + ','.join(hdr)[:120])
-    out = {}
+    out = {}; xs = {}; dpi = ix.get('DELIV_PER')
     for r in rows:
         if len(r) < len(hdr): continue
         sym = r[ix['SYMBOL']].strip()
-        if sym not in wanted or r[ix['SERIES']].strip() != 'EQ': continue
+        if sym not in wanted: continue
+        ser = r[ix['SERIES']].strip()
+        if ser != 'EQ': xs[sym] = ser; continue
         v = [_num(r[ix[k]]) for k in ('OPEN_PRICE', 'HIGH_PRICE', 'LOW_PRICE', 'CLOSE_PRICE', 'PREV_CLOSE', 'TTL_TRD_QNTY')]
         if None in v or v[3] <= 0: continue
-        out[sym] = [round(v[0], 2), round(v[1], 2), round(v[2], 2), round(v[3], 2), round(v[4], 2), int(v[5])]
+        dp = _num(r[dpi]) if dpi is not None else None
+        out[sym] = [round(v[0], 2), round(v[1], 2), round(v[2], 2), round(v[3], 2), round(v[4], 2), int(v[5]), (round(dp, 1) if dp is not None and 0 <= dp <= 100 else None)]
     n = vix = None
     try:
         r2 = list(csv.reader(io.StringIO(http_get(idx_url(d), tries=2, timeout=40).decode('utf-8', 'replace')))); h2 = [h.strip().upper() for h in r2[0]]
@@ -514,7 +611,7 @@ def fetch_day(d, wanted):
             if nm == 'NIFTY 50': q = [_num(r[k]) for k in (oi, hi, li, ci)]; n = q if None not in q else None
             elif nm == 'INDIA VIX': vix = _num(r[ci])
     except Exception as e: log('Index file problem for', d, str(e)[:80])
-    return {'s': out, 'n': n, 'v': vix}
+    return {'s': out, 'n': n, 'v': vix, 'x': xs}
 
 def nse_load(uni, deadline_min=None):
     wanted = set(uni); folder = nse_dir(); hol_path = os.path.join(folder, '_holidays.json'); hol = set(jload(hol_path, [])); today = now().date(); t_end = time.time() + deadline_min * 60 if deadline_min else None
@@ -577,13 +674,18 @@ def nse_load(uni, deadline_min=None):
         rows = per.get(sym)
         if not rows or len(rows) < 30: failed.append((sym, 'no NSE price history')); continue
         # splits and bonuses: NSE's "previous close" is already adjusted, so a gap against yesterday's close marks one; scale the older prices
-        fac = 1.0; n = len(rows); o = [0.0] * n; h = [0.0] * n; l = [0.0] * n; c = [0.0] * n; v = [0] * n
+        fac = 1.0; n = len(rows); o = [0.0] * n; h = [0.0] * n; l = [0.0] * n; c = [0.0] * n; v = [0] * n; dpl = [None] * n
         for i in range(n - 1, -1, -1):
             if i < n - 1:
                 pc = rows[i + 1][1][4]; cl = rows[i][1][3]
                 if cl > 0 and pc > 0 and abs(pc / cl - 1) > 0.04: fac *= pc / cl; adj += 1
-            r = rows[i][1]; o[i], h[i], l[i], c[i] = (round(x * fac, 3) for x in r[:4]); v[i] = int(r[5] / fac) if fac > 0 else r[5]
-        bars[sym] = {'d': [x[0] for x in rows], 'o': o, 'h': h, 'l': l, 'c': c, 'v': v}
+            r = rows[i][1]; o[i], h[i], l[i], c[i] = (round(x * fac, 3) for x in r[:4]); v[i] = int(r[5] / fac) if fac > 0 else r[5]; dpl[i] = r[6] if len(r) > 6 else None
+        bars[sym] = {'d': [x[0] for x in rows], 'o': o, 'h': h, 'l': l, 'c': c, 'v': v, 'dp': dpl}
+    SERIES_X.clear()
+    for dd in dates[-3:]:
+        for sym, ser in (alld[dd].get('x') or {}).items(): SERIES_X[sym] = ser
+    for sym in list(SERIES_X):
+        if sym in alld[dates[-1]]['s']: del SERIES_X[sym]
     # Days with no official Nifty value (NSE did not publish the index file): estimate from the average move of the large stocks
     filled = 0
     have = {d: i for i, d in enumerate(nb['d'])}
@@ -693,16 +795,25 @@ def refresh():
             try: EVENTS, EV_NOTE = fetch_events(now().date())
             except Exception as e: EVENTS, EV_NOTE = None, str(e)[:100]
         log('Results calendar:', EV_NOTE)
+        global FLOWS
+        FLOWS = None
+        if not MOCK or TEST_HOOK:
+            try: FLOWS = fetch_flows()
+            except Exception as e: log('FII/DII flows unavailable:', str(e)[:80])
         STATUS.update(msg='Working out ideas…')
         asof = nb['d'][-1]; ni = prep(nb); inds = {s: prep(b) for s, b in bars.items()}
         regs = regime_series(nb, ni, vb); ri, vix = regs[asof]
+        compute_sectors(uni, bars)
         ideas, vetoed, skipped = build_ideas(uni, bars, inds, regs, nb, asof)
-        news_ok = news_tried = 0
+        news_ok = news_tried = 0; res_w = res_t = 0
         if not MOCK or TEST_HOOK:
             STATUS.update(msg='Reading news headlines…')
             try: news_ok, news_tried = attach_news(ideas)
             except Exception as e: log('News step failed:', e)
             log('News headlines: %d of %d ideas' % (news_ok, news_tried))
+            try:
+                ideas, res_w, res_t = apply_news_events(ideas, vetoed); log('Results dates from headlines: %d of %d looked up' % (res_w, res_t))
+            except Exception as e: log('Results-from-news step failed:', e)
         CACHE.update(meta=uni, bars=bars, ind=inds, regimes=regs, nifty=nb)
         P = run_paper(ideas, bars, nb, regs, asof)
         STATUS.update(msg='Testing the strategies on history…')
@@ -713,7 +824,7 @@ def refresh():
         nse_chk = cross_check(bars, asof) if not USE_NSE else {'ok': True, 'n': len(bars), 'text': info, 'mismatch': [], 'date': asof}; tz = now().strftime('%d %b, %H:%M')
         H = {'nse_eod': ['good' if nse_chk['ok'] else 'warn', 'Healthy' if nse_chk['ok'] else 'Unavailable' if nse_chk['n'] == 0 else 'Check', tz, nse_chk['text']] if not MOCK else ['off', 'Mock', tz, 'Mock mode'],
              'yahoo': (['off', 'Not used', '—', 'Yahoo blocks GitHub servers, so NSE daily files are used'] if USE_NSE else ['good' if len(failed) < 0.05 * len(syms) else 'warn', 'Healthy' if len(failed) < 0.05 * len(syms) else 'Partial', tz, f'{len(bars)} of {len(syms)} stocks downloaded' + (f', {len(failed)} failed' if failed else '')]),
-             'nse_ann': (['good', 'Healthy', tz, EV_NOTE] if EVENTS else ['off', 'Mock', tz, 'Mock mode'] if MOCK else ['warn', 'Unavailable', tz, EV_NOTE + '. Results dates are NOT being checked.']),
+             'nse_ann': (['good', 'Healthy', tz, EV_NOTE] if EVENTS else ['off', 'Mock', tz, 'Mock mode'] if MOCK else (['warn', 'Partly', tz, EV_NOTE + '. Results inferred from headlines for %d of %d ideas (not official).' % (res_w, res_t)] if res_w else ['warn', 'Unavailable', tz, EV_NOTE + '. Results dates are NOT being checked.'])),
              'rss': (['off', 'Mock', tz, 'Mock mode'] if MOCK else ['good', 'Healthy', tz, 'Headlines found for %d of %d ideas' % (news_ok, news_tried)] if news_ok else ['warn', 'Unavailable', tz, 'Google News did not answer, so no headlines are shown'] if news_tried else ['off', 'Idle', tz, 'No ideas today, nothing to look up']),
              'gdelt': ['off', 'Not built yet', '—', 'Planned'], 'rbi': ['off', 'Not built yet', '—', 'Planned'], 'screener': ['off', 'Off', 'never', 'Terms not yet confirmed']}
         age = (now().date() - dt.date.fromisoformat(asof)).days
@@ -722,9 +833,11 @@ def refresh():
         if cached or uerr: inbox.append(('warn', 'NSE stock lists', 'Some index lists could not be read from NSE: ' + '; '.join(uerr[:3]), 'Used the lists saved last time.' if cached else 'Used what could be read.', 'Check the Data health tab.'))
         for m in nse_chk['mismatch'][:5]: inbox.append(('warn', f"Two price sources disagree for {m[0]}", f'Yahoo shows ₹{m[1]:.2f}, the NSE file shows ₹{m[2]:.2f} for {nse_chk["date"]}. A split or bonus may not be applied yet.', 'Kept it in the list but treat its numbers with care.', 'Check the price in your broker app before acting.'))
         if MOCK: pass
-        elif EVENTS is None: inbox.append(('crit', 'Results dates not checked', 'NSE\'s event calendar could not be read (' + EV_NOTE + '). NSE often blocks cloud servers. A stock can show a clean setup while its quarterly results are due in a few days.', 'Showed ideas without any results-date check.', 'Before acting on any idea, look up its results date in your broker app or on NSE.'))
+        elif EVENTS is None: inbox.append(('crit', 'Results dates not checked', 'NSE\'s event calendar could not be read (' + EV_NOTE + '). NSE often blocks cloud servers. ' + ('As a rough substitute, headlines were searched for results dates for %d of %d ideas; these are not official.' % (res_w, res_t) if res_w else 'A stock can show a clean setup while its quarterly results are due in a few days.'), 'Used headlines where possible, otherwise showed ideas without a results-date check.', 'Before acting on any idea, look up its results date in your broker app or on NSE.'))
         else: inbox.append(('info', 'Results dates are checked', EV_NOTE + '. Ideas with results due within 7 days are skipped; results inside the holding period lower the tier. Companies announce a date only about a week ahead, so a missing date is not proof of none.', '—', 'Nothing.'))
         if not MOCK and news_tried and not news_ok: inbox.append(('warn', 'News headlines unavailable', 'Google News did not answer, so ideas show no headlines.', 'Showed ideas without news.', 'Read the latest news for a stock yourself before acting.'))
+        if not MOCK and not FLOWS: inbox.append(('info', 'FII/DII flows not available', 'NSE did not give the daily foreign and domestic institutional flows to this server, so they are not shown or used.', '—', 'Check them on NSE or your broker app if you want that context.'))
+        if not MOCK and not SECTORS: inbox.append(('info', 'Sector strength unavailable', 'Too few stocks had a sector label to rank sectors.', '—', 'Nothing.'))
         if not MOCK: inbox.append(('info', 'News is only a list of headlines', 'Headlines are matched by company name and can be about a different company or old. Words like fraud, probe or penalty are flagged, but the app cannot judge good or bad news.', '—', 'Open the headline and read it before acting.'))
         inbox.append(('info', 'Backtests are flattering', 'Backtests use today\'s index members, so companies that fell out of the index or were delisted are missing. Real results are likely lower.', '—', 'Treat the Backtest Lab as a screening tool, not a promise.'))
         if P['pending']: inbox.append(('info', f"{len(P['pending'])} bot trades waiting to start", 'The bot follows its own Tier 1 and 2 ideas on paper. They start at the next session\'s opening price.', '—', 'Nothing.'))
@@ -743,7 +856,7 @@ def refresh():
             ed = dt.date.fromisoformat(o['ed']); b = bars[o['t']]; held = len(b['d']) - 1 - (b['d'].index(o['ed']) if o['ed'] in b['d'] else 0)
             openout.append({**{k: o[k] for k in ('t', 'n', 'st', 'tier', 'entry', 'qty', 'stop', 'target', 'last', 'wk')}, 'days': held * 7 // 5, 'd0': -(dt.date.fromisoformat(asof) - ed).days})
         label = ['Trending up', 'Sideways', 'Weak or volatile'][ri]
-        detail = f"Nifty {nb['c'][-1]:,.0f} · 50-day {ni['s50'][-1]:,.0f} · 200-day {ni['s200'][-1]:,.0f}"
+        detail = f"Nifty {nb['c'][-1]:,.0f} · 50-day {ni['s50'][-1]:,.0f} · 200-day {ni['s200'][-1]:,.0f}" + (f" · FII net ₹{FLOWS['fii']:,.0f} cr" if FLOWS and 'fii' in FLOWS else '') + (f" · DII net ₹{FLOWS['dii']:,.0f} cr" if FLOWS and 'dii' in FLOWS else '')
         state = {'empty': False, 'mock': MOCK, 'asof': asof, 'generated': now().isoformat(timespec='seconds'), 'regime': {'idx': ri, 'label': label, 'vix': round(vix, 1), 'detail': detail},
                  'ideas': ideas, 'vetoed': vetoed, 'health': H, 'inbox': [{'id': 'r%d' % i, 'sev': a, 'title': b_, 'body': c_, 'did': d_, 'need': e_, 'when': tz} for i, (a, b_, c_, d_, e_) in enumerate(inbox)],
                  'open': openout, 'journal': P['closed'][-300:][::-1], 'pending': len(P['pending']), 'eq': {'dates': last160, 'bot': eqb, 'nifty': eqn}, 'tested': tested,
@@ -753,6 +866,27 @@ def refresh():
     except Exception as e:
         import traceback; traceback.print_exc(); STATUS.update(msg='Failed: ' + str(e)[:200])
     finally: STATUS['running'] = False
+
+# ---------------------------------------------------------------- alerts (phone notifications through ntfy.sh, free)
+def make_alerts(prev, st):
+    """Compares today's state with yesterday's. Marks new ideas on st['ideas'] and returns a list of alert dicts."""
+    alerts = []
+    if not prev: return alerts
+    old = {i['t']: i for i in prev.get('ideas', [])}
+    for i in st['ideas']:
+        o = old.get(i['t']); i['new'] = o is None
+        if i['tier'] <= 2 and (o is None or o['tier'] > i['tier']):
+            alerts.append({'k': 'idea', 't': i['t'], 'text': '%s (Tier %d, %s): entry %.2f, stop %.2f, target %.2f' % (i['n'], i['tier'], {'brk': 'breakout', 'pb': 'pullback', 'mr': 'mean reversion'}.get(i['st'], i['st']), i['entry'], i['stop'], i['target'])})
+    pa = prev.get('asof') or ''
+    for t in st.get('journal', []):
+        if t.get('exit', '') > pa:
+            alerts.append({'k': 'exit', 't': t['t'], 'text': '%s paper trade closed: %s (%s%.1fR, ₹%s)' % (t['n'], t.get('exitWhy', 'exit'), '+' if t['R'] >= 0 else '−', abs(t['R']), format(abs(round(t['net'])), ',')) })
+    return alerts
+def push_ntfy(topic, title, body, click=''):
+    msg = {'topic': topic, 'title': title, 'message': body[:3500], 'tags': ['chart_with_upwards_trend'], 'priority': 3}
+    if click: msg['click'] = click
+    req = urllib.request.Request('https://ntfy.sh/', data=json.dumps(msg).encode('utf-8'), headers={'Content-Type': 'application/json'})
+    with urllib.request.urlopen(req, timeout=20) as r: return r.status
 
 def cross_check(bars, asof):
     if MOCK: return {'ok': True, 'n': 0, 'text': '', 'mismatch': [], 'date': asof}

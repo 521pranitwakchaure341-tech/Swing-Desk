@@ -30,6 +30,9 @@ try:
     _ev, _note = s.fetch_events(_dt.date.today()); print('PROBE', 'ok     ' if _ev else 'blocked', 'NSE results calendar ->', _note)
 except Exception as e: print('PROBE blocked NSE results calendar ->', str(e)[:80])
 print('---')
+prev = None
+try: prev = json.load(open(os.path.join(DOCS, 'state.json')))
+except Exception: pass
 s.USE_NSE = True            # Yahoo blocks GitHub's servers, so use NSE's own daily files
 s.refresh()
 st = s.CACHE.get('state')
@@ -37,6 +40,21 @@ if not st or s.STATUS['msg'].startswith('Failed'):
     print('Refresh failed:', s.STATUS['msg']); sys.exit(1)
 nb = s.CACHE['nifty']; st['nifty'] = {'d': nb['d'], 'c': nb['c']}
 st['static'] = True
+# ---- alerts: new Tier 1/2 ideas and closed paper trades, pushed to your phone through ntfy.sh if you set a topic
+alerts = s.make_alerts(prev, st); st['alerts'] = alerts
+topic = os.environ.get('NTFY_TOPIC', '').strip(); st['ntfy'] = bool(topic)
+if topic:
+    repo = os.environ.get('GITHUB_REPOSITORY', ''); click = ('https://%s.github.io/%s/' % (repo.split('/')[0].lower(), repo.split('/')[1])) if '/' in repo else ''
+    try:
+        if not (prev or {}).get('ntfy'):
+            s.push_ntfy(topic, 'Swing Desk alerts are on', 'You will get a message here when a new Tier 1 or Tier 2 idea appears or a paper trade closes.', click); print('ALERT hello sent')
+        if alerts:
+            ni = sum(1 for a in alerts if a['k'] == 'idea'); nx = len(alerts) - ni
+            title = 'Swing Desk: ' + ', '.join(x for x in (('%d new idea%s' % (ni, '' if ni == 1 else 's')) if ni else '', ('%d trade%s closed' % (nx, '' if nx == 1 else 's')) if nx else '') if x)
+            s.push_ntfy(topic, title, '\n'.join('• ' + a['text'] for a in alerts[:8]), click); print('ALERT sent:', len(alerts))
+        else: print('ALERT none today')
+    except Exception as e: print('ALERT failed:', str(e)[:100])
+else: print('ALERT off (no NTFY_TOPIC set)')
 json.dump(st, open(os.path.join(DOCS, 'state.json'), 'w'), separators=(',', ':'))
 for k in ('brk', 'pb', 'mr'):
     t = s.collect_trades(k); json.dump(t, open(os.path.join(DOCS, f'trades_{k}.json'), 'w'), separators=(',', ':')); print(k, len(t), 'trades')
