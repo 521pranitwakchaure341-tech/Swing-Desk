@@ -220,7 +220,7 @@ const SOURCES = [
   { id: 'rbi', name: 'RBI and NSDL releases', supplies: 'Macro data, foreign portfolio flows', kind: 'Free official', on: true },
   { id: 'screener', name: 'Screener.in and Trendlyne', supplies: 'Fundamentals', kind: 'Free, terms to be confirmed', on: false, note: 'Off until their terms of use are confirmed.' },
   { id: 'indianapi', name: 'IndianAPI.in (free plan)', supplies: 'Board meetings and results dates, dividends. Best picks only, up to 5 a day', kind: 'Free plan, 500 requests a month', on: true, note: 'Runs in the daily update. To switch off, delete the INDIANAPI_KEY secret on GitHub.' },
-  { id: 'eodhd', name: 'EODHD (free plan)', supplies: 'Profit and revenue growth, return on equity, last report date. Best 2 picks a day', kind: 'Free plan, 20 calls a day', on: true, note: 'Runs in the daily update. To switch off, delete the EODHD_KEY secret on GitHub.' }
+  { id: 'eodhd', name: 'EODHD (free plan)', supplies: 'News mood (positive/negative score) and upcoming dividend dates. Best 3 picks a day', kind: 'Free plan, 20 calls a day, no fundamentals', on: true, note: 'Runs in the daily update. To switch off, delete the EODHD_KEY secret on GitHub.' }
 ];
 const HEALTH = { nse_eod: ['good', 'Healthy', '18:42 yesterday', 'File read in 3.1 s'], nse_ann: ['warn', 'Slow', '18:44 yesterday', 'Page answered after 14 s'], yahoo: ['good', 'Healthy', '18:43 yesterday', 'Prices match NSE on 499 of 500 stocks'], rss: ['good', 'Healthy', '06:10 today', '412 headlines read'], gdelt: ['good', 'Healthy', '02:00 today', 'Tone scores updated'], rbi: ['good', 'Healthy', '19 Nov, 09:00', 'Weekly release read'], screener: ['off', 'Off', 'never', 'Terms not yet confirmed'] };
 
@@ -1110,7 +1110,7 @@ function stressHtml(res) {
 function fundHtml(d) {
   const f = d.fund; if (!f || !((f.items && f.items.length) || (f.notes && f.notes.length))) return '';
   const when = f.at ? new Date(f.at + 'T00:00:00').toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }) : '';
-  return `<div class="evb"><b>Fundamentals</b> <small>${esc((f.src || []).join(' + '))}${when ? ' · looked up ' + when : ''}</small>${f.items && f.items.length ? '<br>' + f.items.map(x => esc(x[0]) + ': <b>' + esc(x[1]) + '</b>').join(' · ') : ''}${(f.notes || []).map(n => '<br>' + esc(n)).join('')}</div>`;
+  return `<div class="evb"><b>Extra checks</b> <small>${esc((f.src || []).join(' + '))}${when ? ' · looked up ' + when : ''}</small>${f.items && f.items.length ? '<br>' + f.items.map(x => esc(x[0]) + ': <b>' + esc(x[1]) + '</b>').join(' · ') : ''}${(f.notes || []).map(n => '<br>' + esc(n)).join('')}</div>`;
 }
 
 (function boot() {

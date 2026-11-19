@@ -385,7 +385,7 @@ def apply_news_events(ideas, vetoed):
 
 # ---------------------------------------------------------------- free-plan fundamentals for the best picks only (IndianAPI.in and EODHD)
 IA_MONTH_CAP = 500; IA_RESERVE = 20; IA_MAX_PER_DAY = 5          # IndianAPI free plan: 500 requests a month. We keep a reserve and never use more than 5 a day.
-ED_DAY_CALLS = 20; ED_COST = 10                                  # EODHD free plan: 20 calls a day; one fundamentals request costs 10, so 2 stocks a day.
+ED_DAY_CALLS = 20; ED_COST = 6                                   # EODHD free plan: 20 calls a day, no fundamentals. We use News (5 calls, with a sentiment score) + Dividends (1 call) = 6 per stock, so 3 stocks a day.
 FUND_KEEP_DAYS = 5                                               # a stock looked up in the last 5 days is not looked up again (saves the free allowance)
 API_KEYS = {'ia': '', 'ed': ''}                                  # filled from the environment by the phone build; never stored in a file
 def find_key(o, names, depth=0):
@@ -422,12 +422,20 @@ def shape(o, depth=0):
     return ''
 def ia_fetch(name):
     return api_json('https://stock.indianapi.in/stock?name=' + urllib.parse.quote(name), {'x-api-key': API_KEYS['ia']})
-def ed_fetch(sym):
-    q = urllib.parse.quote(sym); tok = urllib.parse.quote(API_KEYS['ed'])
-    try: return api_json('https://eodhd.com/api/v1.1/fundamentals/%s.NSE?api_token=%s&filter=%s' % (q, tok, 'Highlights,Valuation,Earnings'))
+def ed_fetch(sym, today=None):
+    """EODHD free plan: news with a sentiment score (5 calls) and upcoming dividends (1 call). Fundamentals are not on the free plan."""
+    q = urllib.parse.quote(sym); tok = urllib.parse.quote(API_KEYS['ed']); today = today or now().date()
+    out = {'news': None, 'div': None, 'err': []}
+    try: out['news'] = api_json('https://eodhd.com/api/news?s=%s.NSE&offset=0&limit=12&from=%s&api_token=%s&fmt=json' % (q, (today - dt.timedelta(days=10)).isoformat(), tok))
     except RuntimeError as e:
-        if 'HTTP 404' not in str(e): raise
-        return api_json('https://eodhd.com/api/fundamentals/%s.NSE?api_token=%s&fmt=json' % (q, tok))
+        if any(c in str(e) for c in ('401', '402', '403')): raise
+        out['err'].append('news ' + str(e)[:80])
+    try: out['div'] = api_json('https://eodhd.com/api/div/%s.NSE?from=%s&to=%s&api_token=%s&fmt=json' % (q, today.isoformat(), (today + dt.timedelta(days=45)).isoformat(), tok))
+    except RuntimeError as e:
+        if any(c in str(e) for c in ('401', '402', '403')): raise
+        out['err'].append('dividends ' + str(e)[:80])
+    if out['news'] is None and out['div'] is None: raise RuntimeError('; '.join(out['err']) or 'no answer')
+    return out
 def ia_parse(j, today):
     """Pulls board-meeting / results dates and dividend dates out of IndianAPI's answer, whatever its exact layout."""
     out = {'meet': None, 'div': None, 'keys': sorted(j.keys())[:25] if isinstance(j, dict) else []}
@@ -452,22 +460,21 @@ def ia_parse(j, today):
         if out['div']: break
     return out
 def ed_parse(j, today):
-    out = {'items': [], 'last': None, 'keys': sorted(j.keys())[:10] if isinstance(j, dict) else []}
-    h = j.get('Highlights') if isinstance(j, dict) else None
-    if isinstance(h, dict):
-        for lab, k in (('Profit growth vs a year ago', 'QuarterlyEarningsGrowthYOY'), ('Revenue growth vs a year ago', 'QuarterlyRevenueGrowthYOY'), ('Return on equity', 'ReturnOnEquityTTM'), ('Profit margin', 'ProfitMargin')):
-            v = _pct(h.get(k)); 
-            if v is not None: out['items'].append([lab, '%+.0f%%' % v if 'growth' in lab else '%.0f%%' % v, v])
-        try:
-            pe = float(h.get('PERatio'))
-            if pe > 0: out['items'].append(['P/E', '%.0f' % pe, pe])
-        except Exception: pass
-    e = j.get('Earnings') if isinstance(j, dict) else None
-    hist = e.get('History') if isinstance(e, dict) else None
-    if isinstance(hist, dict):
-        ds = [_parse_date(v.get('reportDate') or v.get('date') or k) for k, v in hist.items() if isinstance(v, dict)]
-        ds = [d for d in ds if d and d <= today]
-        if ds: out['last'] = max(ds)
+    """News sentiment (average polarity -1..+1 over recent articles) and the next ex-dividend date."""
+    out = {'items': [], 'last': None, 'sent': None, 'div': None, 'keys': []}
+    nw = j.get('news') if isinstance(j, dict) else None
+    if isinstance(nw, list):
+        pol = []
+        for a in nw[:12]:
+            sv = a.get('sentiment') if isinstance(a, dict) else None
+            try:
+                if isinstance(sv, dict) and sv.get('polarity') is not None: pol.append(float(sv['polarity']))
+            except Exception: pass
+        out['sent'] = [round(sum(pol) / len(pol), 2) if pol else None, len(nw), len(pol)]
+    dv = j.get('div') if isinstance(j, dict) else None
+    for it in (dv if isinstance(dv, list) else [])[:10]:
+        d = _parse_date(it.get('date')) if isinstance(it, dict) and it.get('date') else None
+        if d and d >= today and (out['div'] is None or d < out['div']): out['div'] = d
     return out
 def _ev_from_date(d, today, wk, src, label):
     n = (d - today).days
@@ -517,10 +524,11 @@ def apply_api(ideas, vetoed, today, prev_usage, cache):
         d = data.setdefault(t, {'at': today.isoformat(), 'items': [], 'src': []})
         u['ed'] += ED_COST
         try:
-            j = ed_fetch(t); r = ed_parse(j, today); ed_ok += 1; d['src'] = sorted(set(d['src'] + ['EODHD']))
-            d['items'] = [x[:3] for x in r['items']]
-            if r['last']: d['last'] = r['last'].isoformat()
-            if ed_ok == 1: info['shape_ed'] = shape(j)[:300]; print('API SHAPE EODHD:', info['shape_ed'], '| fields read:', len(r['items']))
+            j = ed_fetch(t, today); r = ed_parse(j, today); ed_ok += 1; d['src'] = sorted(set(d['src'] + ['EODHD']))
+            if r['sent']: d['sent'] = r['sent']
+            if r['div'] and not d.get('div'): d['div'] = r['div'].isoformat()
+            if j.get('err'): info['errors'].append('EODHD ' + t + ': ' + '; '.join(j['err'])); info['err_ed'] = True
+            if ed_ok == 1: info['shape_ed'] = (('news ' + shape(j['news'])) if j.get('news') else 'news: none') + ' | ' + (('dividends ' + shape(j['div'])) if j.get('div') else 'dividends: none'); info['shape_ed'] = info['shape_ed'][:300]; print('API SHAPE EODHD:', info['shape_ed'], '| sentiment:', r['sent'], '| next ex-dividend:', r['div'])
         except Exception as e:
             info['errors'].append('EODHD ' + t + ': ' + str(e)[:140]); info['err_ed'] = True
             if '401' in str(e) or '402' in str(e) or '403' in str(e): break
@@ -528,7 +536,7 @@ def apply_api(ideas, vetoed, today, prev_usage, cache):
     keep = []
     for i in ideas:
         d = data.get(i['t'])
-        if not d or not (d.get('items') or d.get('meet') or d.get('last') or d.get('div')): keep.append(i); continue
+        if not d or not (d.get('items') or d.get('meet') or d.get('last') or d.get('div') or d.get('sent')): keep.append(i); continue
         info['picked'].append(i['t']); notes = []
         # results date: IndianAPI's board-meeting list beats headline guesses; EODHD's last report date gives a rough estimate
         ev = None
@@ -543,6 +551,14 @@ def apply_api(ideas, vetoed, today, prev_usage, cache):
         if ev:
             i['ev'] = ev
             if ev['lvl'] == 'warn' and i['tier'] == 1: i['tier'] = 2
+        sv = d.get('sent')
+        if sv:
+            if sv[0] is None: notes.append('EODHD found %d recent articles but no sentiment score.' % sv[1] if sv[1] else 'EODHD has no recent news on this stock.')
+            else:
+                lab = 'negative' if sv[0] <= -0.25 else 'positive' if sv[0] >= 0.25 else 'mixed'
+                notes.append('EODHD news mood: %s (average score %+.2f over %d recent articles).' % (lab, sv[0], sv[2]))
+                if lab == 'negative' and sv[2] >= 3: i['bad'].append('News mood negative (EODHD)'); i['fundflag'] = True
+                elif lab == 'positive' and sv[2] >= 3: i['chk'].append('News mood positive (EODHD)')
         if d.get('div'): notes.append('Ex-dividend date about %s: the price usually drops by the dividend that day.' % dt.date.fromisoformat(d['div']).strftime('%d %b'))
         for lab, val, num in d.get('items', []):
             if lab.startswith('Profit growth'):
@@ -553,7 +569,7 @@ def apply_api(ideas, vetoed, today, prev_usage, cache):
         i['fund'] = {'src': d.get('src', []), 'at': d['at'], 'items': [[a, b] for a, b, _ in d.get('items', [])], 'notes': notes}
         keep.append(i)
     info['ia'] = [ia_ok, len(ia_set)]; info['ed'] = [ed_ok, len(ed_set)]; info['reused'] = len(fresh)
-    info['cache'] = {t: dict(v) for t, v in data.items() if (today - dt.date.fromisoformat(v['at'])).days <= 10 and (v.get('items') or v.get('meet') or v.get('last'))}
+    info['cache'] = {t: dict(v) for t, v in data.items() if (today - dt.date.fromisoformat(v['at'])).days <= 10 and (v.get('items') or v.get('meet') or v.get('last') or v.get('div') or v.get('sent'))}
     info['ia_left'] = IA_MONTH_CAP - u['ia']
     return keep, u, info
 def _wd(today, day):
@@ -1010,7 +1026,7 @@ def refresh():
              'nse_ann': (['good', 'Healthy', tz, EV_NOTE] if EVENTS else ['off', 'Mock', tz, 'Mock mode'] if MOCK else (['warn', 'Partly', tz, EV_NOTE + '. Results inferred from headlines for %d of %d ideas (not official).' % (res_w, res_t)] if res_w else ['warn', 'Unavailable', tz, EV_NOTE + '. Results dates are NOT being checked.'])),
              'rss': (['off', 'Mock', tz, 'Mock mode'] if MOCK else ['good', 'Healthy', tz, 'Headlines found for %d of %d ideas' % (news_ok, news_tried)] if news_ok else ['warn', 'Unavailable', tz, 'Google News did not answer, so no headlines are shown'] if news_tried else ['off', 'Idle', tz, 'No ideas today, nothing to look up']),
              'indianapi': (['off', 'No key', '—', 'Not set up. Add INDIANAPI_KEY as a GitHub secret to switch on.'] if not API_KEYS['ia'] else ['warn' if (API_INFO and API_INFO.get('err_ia')) else 'good', 'Healthy' if not (API_INFO and API_INFO.get('err_ia')) else 'Problem', tz, (('%d of %d best picks looked up today; %s requests left this month. ' % (API_INFO['ia'][0], API_INFO['ia'][1], API_INFO['ia_left'])) + ('Layout: ' + API_INFO['shape_ia'] if API_INFO.get('shape_ia') else '') + ' '.join(e for e in API_INFO['errors'] if e.startswith('IndianAPI'))) if API_INFO else 'Waiting for the next run']),
-             'eodhd': (['off', 'No key', '—', 'Not set up. Add EODHD_KEY as a GitHub secret to switch on.'] if not API_KEYS['ed'] else ['warn' if (API_INFO and API_INFO.get('err_ed')) else 'good', 'Healthy' if not (API_INFO and API_INFO.get('err_ed')) else 'Problem', tz, (('%d of %d best picks looked up today (2 a day on the free plan). ' % (API_INFO['ed'][0], API_INFO['ed'][1])) + ('Layout: ' + API_INFO['shape_ed'] if API_INFO.get('shape_ed') else '') + ' '.join(e for e in API_INFO['errors'] if e.startswith('EODHD'))) if API_INFO else 'Waiting for the next run']),
+             'eodhd': (['off', 'No key', '—', 'Not set up. Add EODHD_KEY as a GitHub secret to switch on.'] if not API_KEYS['ed'] else ['warn' if (API_INFO and API_INFO.get('err_ed')) else 'good', 'Healthy' if not (API_INFO and API_INFO.get('err_ed')) else 'Problem', tz, (('%d of %d best picks looked up today (news mood + dividend dates, 3 a day on the free plan). ' % (API_INFO['ed'][0], API_INFO['ed'][1])) + ('Layout: ' + API_INFO['shape_ed'] if API_INFO.get('shape_ed') else '') + ' '.join(e for e in API_INFO['errors'] if e.startswith('EODHD'))) if API_INFO else 'Waiting for the next run']),
              'gdelt': ['off', 'Not built yet', '—', 'Planned'], 'rbi': ['off', 'Not built yet', '—', 'Planned'], 'screener': ['off', 'Off', 'never', 'Terms not yet confirmed']}
         if API_INFO and API_INFO['errors']: inbox.append(('warn', 'Fundamentals lookup had errors', '; '.join(API_INFO['errors'][:3]), 'Skipped those lookups and kept the ideas.', 'A 401, 402 or 403 usually means the key is wrong or the free plan does not include that data. Check the key in your GitHub secrets.'))
         if (API_KEYS['ia'] or API_KEYS['ed']) and not API_INFO: inbox.append(('info', 'Fundamentals lookup skipped', 'No ideas needed a lookup today, or the step failed.', '—', 'Nothing.'))
