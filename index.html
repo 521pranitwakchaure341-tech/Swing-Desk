@@ -940,9 +940,13 @@ function applyLive(st) {
   else paintBanner();
 }
 
+function checkText(st) {
+  const h = (st && st.health) || {}, r = h.nse_ann && h.nse_ann[0] === 'good', n = h.rss && h.rss[0] === 'good';
+  return (r ? 'Results dates are checked.' : 'Results dates could NOT be checked.') + ' ' + (n ? 'News headlines are shown.' : 'News could not be read.');
+}
 function paintBanner() {
   const st = LIVE.st, el = $('.demo .wrap'); if (!el) return;
-  el.innerHTML = LIVE.running ? `<b>Updating…</b><span>${esc(LIVE.msg)} ${LIVE.total ? LIVE.done + ' of ' + LIVE.total : ''}</span>` : st ? `<b>Real prices up to ${dstr(TODAY)}.</b><span>${STATIC ? 'Updates itself every evening. ' : ''}Suggestions only, not advice. Results dates and news are not checked yet.</span>` : '<b>Getting started…</b>';
+  el.innerHTML = LIVE.running ? `<b>Updating…</b><span>${esc(LIVE.msg)} ${LIVE.total ? LIVE.done + ' of ' + LIVE.total : ''}</span>` : st ? `<b>Real prices up to ${dstr(TODAY)}.</b><span>${STATIC ? 'Updates itself every evening. ' : ''}Suggestions only, not advice. ${checkText(st)}</span>` : '<b>Getting started…</b>';
 }
 let pollT = null;
 async function pollStatus() {
