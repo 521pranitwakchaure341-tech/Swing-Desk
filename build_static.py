@@ -33,6 +33,9 @@ print('---')
 prev = None
 try: prev = json.load(open(os.path.join(DOCS, 'state.json')))
 except Exception: pass
+s.API_KEYS['ia'] = os.environ.get('INDIANAPI_KEY', '').strip(); s.API_KEYS['ed'] = os.environ.get('EODHD_KEY', '').strip()
+s.API_PREV = {'usage': (prev or {}).get('api_usage'), 'cache': (prev or {}).get('fund_cache') or {}}
+print('API keys present: IndianAPI', bool(s.API_KEYS['ia']), '| EODHD', bool(s.API_KEYS['ed']))
 s.USE_NSE = True            # Yahoo blocks GitHub's servers, so use NSE's own daily files
 s.refresh()
 st = s.CACHE.get('state')

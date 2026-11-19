@@ -303,6 +303,7 @@ def event_info(sym, today, wk):
 
 SERIES_X = {}                       # stocks NSE shows outside the normal EQ series on the latest days (trade-to-trade = surveillance)
 SECTORS = {}                        # sector -> {'ret': median 3-month return %, 'rank': 1 = strongest, 'of': number of sectors}
+API_PREV = {}                       # carried from yesterday's state.json by the phone build: {'usage': {...}, 'cache': {...}}
 FLOWS = None                        # {'fii': net crore, 'dii': net crore, 'date': text} when NSE answers
 def compute_sectors(uni, bars):
     by = {}
@@ -381,6 +382,166 @@ def apply_news_events(ideas, vetoed):
         if ne['lvl'] == 'warn' and i['tier'] == 1: i['tier'] = 2
         keep.append(i)
     return keep, worked, tried
+
+# ---------------------------------------------------------------- free-plan fundamentals for the best picks only (IndianAPI.in and EODHD)
+IA_MONTH_CAP = 500; IA_RESERVE = 20; IA_MAX_PER_DAY = 5          # IndianAPI free plan: 500 requests a month. We keep a reserve and never use more than 5 a day.
+ED_DAY_CALLS = 20; ED_COST = 10                                  # EODHD free plan: 20 calls a day; one fundamentals request costs 10, so 2 stocks a day.
+FUND_KEEP_DAYS = 5                                               # a stock looked up in the last 5 days is not looked up again (saves the free allowance)
+API_KEYS = {'ia': '', 'ed': ''}                                  # filled from the environment by the phone build; never stored in a file
+def find_key(o, names, depth=0):
+    if depth > 7: return None
+    if isinstance(o, dict):
+        for k, v in o.items():
+            if k in names and v not in (None, '', [], {}): return v
+        for v in o.values():
+            r = find_key(v, names, depth + 1)
+            if r is not None: return r
+    elif isinstance(o, list):
+        for v in o[:60]:
+            r = find_key(v, names, depth + 1)
+            if r is not None: return r
+    return None
+def _pct(v):
+    try: v = float(v)
+    except Exception: return None
+    return v * 100 if abs(v) <= 5 else v
+def api_json(url, headers=None):
+    return json.loads(http_get(url, tries=2, timeout=30, headers=headers).decode('utf-8', 'replace'))
+def ia_fetch(name):
+    return api_json('https://stock.indianapi.in/stock?name=' + urllib.parse.quote(name), {'x-api-key': API_KEYS['ia']})
+def ed_fetch(sym):
+    return api_json('https://eodhd.com/api/v1.1/fundamentals/%s.NSE?api_token=%s&filter=%s' % (urllib.parse.quote(sym), urllib.parse.quote(API_KEYS['ed']), 'Highlights,Valuation,Earnings'))
+def ia_parse(j, today):
+    """Pulls board-meeting / results dates and dividend dates out of IndianAPI's answer, whatever its exact layout."""
+    out = {'meet': None, 'div': None, 'keys': sorted(j.keys())[:25] if isinstance(j, dict) else []}
+    bm = find_key(j, ('boardMeetings', 'board_meetings', 'boardMeeting'))
+    items = bm if isinstance(bm, list) else (list(bm.values()) if isinstance(bm, dict) else [])
+    best = None
+    for it in items[:40]:
+        txt = ' '.join(str(v) for v in it.values()) if isinstance(it, dict) else str(it)
+        d = None
+        if isinstance(it, dict):
+            for k in ('date', 'meetingDate', 'boardMeetingDate', 'bm_date', 'Date', 'meeting_date'):
+                if it.get(k): d = _parse_date(it[k]); break
+        if d is None: d = _title_date(txt, today)
+        if d and d >= today - dt.timedelta(days=1) and 'result' in txt.lower() and (best is None or d < best[0]): best = (d, txt[:100])
+    out['meet'] = best
+    dv = find_key(j, ('dividend', 'dividends'))
+    for it in (dv if isinstance(dv, list) else [])[:20]:
+        if isinstance(it, dict):
+            for k in ('exDate', 'ex_date', 'exDividendDate', 'date', 'Date'):
+                d = _parse_date(it.get(k)) if it.get(k) else None
+                if d and today <= d <= today + dt.timedelta(days=28): out['div'] = d; break
+        if out['div']: break
+    return out
+def ed_parse(j, today):
+    out = {'items': [], 'last': None, 'keys': sorted(j.keys())[:10] if isinstance(j, dict) else []}
+    h = j.get('Highlights') if isinstance(j, dict) else None
+    if isinstance(h, dict):
+        for lab, k in (('Profit growth vs a year ago', 'QuarterlyEarningsGrowthYOY'), ('Revenue growth vs a year ago', 'QuarterlyRevenueGrowthYOY'), ('Return on equity', 'ReturnOnEquityTTM'), ('Profit margin', 'ProfitMargin')):
+            v = _pct(h.get(k)); 
+            if v is not None: out['items'].append([lab, '%+.0f%%' % v if 'growth' in lab else '%.0f%%' % v, v])
+        try:
+            pe = float(h.get('PERatio'))
+            if pe > 0: out['items'].append(['P/E', '%.0f' % pe, pe])
+        except Exception: pass
+    e = j.get('Earnings') if isinstance(j, dict) else None
+    hist = e.get('History') if isinstance(e, dict) else None
+    if isinstance(hist, dict):
+        ds = [_parse_date(v.get('reportDate') or v.get('date') or k) for k, v in hist.items() if isinstance(v, dict)]
+        ds = [d for d in ds if d and d <= today]
+        if ds: out['last'] = max(ds)
+    return out
+def _ev_from_date(d, today, wk, src, label):
+    n = (d - today).days
+    if n <= 7: return {'lvl': 'veto', 'd': d.isoformat(), 'n': n, 'src': src, 'text': '%s lists results about %s (in %d days). Results can move a stock 5–10%% overnight, so it is skipped.' % (label, d.strftime('%d %b'), max(n, 0))}
+    if n <= max(21, wk * 7): return {'lvl': 'warn', 'd': d.isoformat(), 'n': n, 'src': src, 'text': '%s lists results about %s (in %d days), inside the likely holding period.' % (label, d.strftime('%d %b'), n)}
+    return {'lvl': 'ok', 'd': d.isoformat(), 'n': n, 'src': src, 'text': '%s lists results about %s (in %d days), after the likely holding period.' % (label, d.strftime('%d %b'), n)}
+def apply_api(ideas, vetoed, today, prev_usage, cache):
+    """Looks up fundamentals only for the best picks, inside both free plans. Returns (ideas kept, usage dict, info dict)."""
+    info = {'ia': None, 'ed': None, 'picked': [], 'errors': []}
+    u = dict(prev_usage or {}); month = today.strftime('%Y-%m')
+    if u.get('m') != month: u['m'] = month; u['ia'] = 0
+    if u.get('d') != today.isoformat(): u['d'] = today.isoformat(); u['ed'] = 0; u['ia_d'] = 0
+    u.setdefault('ia', 0); u.setdefault('ed', 0); u.setdefault('ia_d', 0)
+    uniq = []
+    for i in ideas:
+        if i['t'] not in uniq: uniq.append(i['t'])
+    wd_left = sum(1 for k in range(today.day, 32) if _wd(today, k))
+    ia_room = max(0, IA_MONTH_CAP - IA_RESERVE - u['ia'])
+    ia_today = min(IA_MAX_PER_DAY, ia_room // max(1, wd_left)) if ia_room else 0
+    if ia_room and ia_today == 0: ia_today = 1
+    ia_n = max(0, ia_today - u['ia_d']) if API_KEYS['ia'] else 0
+    ed_n = max(0, (ED_DAY_CALLS - u['ed']) // ED_COST) if API_KEYS['ed'] else 0
+    ia_set = []; ed_set = []; fresh = {}
+    for t in uniq:                                   # best picks first: ideas arrive sorted by tier, then score
+        c = cache.get(t)
+        if c and c.get('at') and (today - dt.date.fromisoformat(c['at'])).days <= FUND_KEEP_DAYS: fresh[t] = c; continue
+        if len(ia_set) < ia_n: ia_set.append(t)
+        if len(ed_set) < ed_n: ed_set.append(t)
+    names = {i['t']: i['n'] for i in ideas}; data = {t: dict(fresh[t]) for t in fresh}
+    ia_ok = ed_ok = 0
+    for t in ia_set:
+        d = data.setdefault(t, {'at': today.isoformat(), 'items': [], 'src': []})
+        u['ia'] += 1; u['ia_d'] += 1
+        try:
+            j = ia_fetch(_clean_name(names[t]) or names[t])
+            cn = str(find_key(j, ('companyName', 'company_name')) or ''); w1 = (_clean_name(names[t]) or names[t]).split()[0].lower()
+            if cn and w1 not in cn.lower(): raise RuntimeError('matched a different company (%s)' % cn[:30])
+            r = ia_parse(j, today); ia_ok += 1; d['src'] = sorted(set(d['src'] + ['IndianAPI']))
+            if r['meet']: d['meet'] = [r['meet'][0].isoformat(), r['meet'][1]]
+            if r['div']: d['div'] = r['div'].isoformat()
+            if ia_ok == 1: print('API SHAPE IndianAPI top-level keys:', r['keys'])
+        except Exception as e:
+            info['errors'].append('IndianAPI ' + t + ': ' + str(e)[:80])
+            if '401' in str(e) or '403' in str(e) or '402' in str(e): break
+        time.sleep(0.5)
+    for t in ed_set:
+        d = data.setdefault(t, {'at': today.isoformat(), 'items': [], 'src': []})
+        u['ed'] += ED_COST
+        try:
+            j = ed_fetch(t); r = ed_parse(j, today); ed_ok += 1; d['src'] = sorted(set(d['src'] + ['EODHD']))
+            d['items'] = [x[:3] for x in r['items']]
+            if r['last']: d['last'] = r['last'].isoformat()
+            if ed_ok == 1: print('API SHAPE EODHD sections:', r['keys'], '| fields read:', len(r['items']))
+        except Exception as e:
+            info['errors'].append('EODHD ' + t + ': ' + str(e)[:80])
+            if '401' in str(e) or '402' in str(e) or '403' in str(e): break
+        time.sleep(0.5)
+    keep = []
+    for i in ideas:
+        d = data.get(i['t'])
+        if not d or not (d.get('items') or d.get('meet') or d.get('last') or d.get('div')): keep.append(i); continue
+        info['picked'].append(i['t']); notes = []
+        # results date: IndianAPI's board-meeting list beats headline guesses; EODHD's last report date gives a rough estimate
+        ev = None
+        if d.get('meet'): ev = _ev_from_date(dt.date.fromisoformat(d['meet'][0]), today, i['wk'], 'indianapi', 'IndianAPI')
+        elif d.get('last') and not (i.get('ev') or {}).get('d'):
+            ago = (today - dt.date.fromisoformat(d['last'])).days
+            if ago >= 75: ev = {'lvl': 'warn', 'src': 'eodhd', 'text': 'It last reported on %s (%d days ago), so the next results are probably due soon. Estimated, not official.' % (dt.date.fromisoformat(d['last']).strftime('%d %b'), ago)}
+            else: notes.append('Last reported results on %s.' % dt.date.fromisoformat(d['last']).strftime('%d %b'))
+        if ev and ev['lvl'] == 'veto':
+            if not any(v['t'] == i['t'] for v in vetoed): vetoed.append({'t': i['t'], 'n': i['n'], 'why': ev['text']})
+            continue
+        if ev:
+            i['ev'] = ev
+            if ev['lvl'] == 'warn' and i['tier'] == 1: i['tier'] = 2
+        if d.get('div'): notes.append('Ex-dividend date about %s: the price usually drops by the dividend that day.' % dt.date.fromisoformat(d['div']).strftime('%d %b'))
+        for lab, val, num in d.get('items', []):
+            if lab.startswith('Profit growth'):
+                if num <= -20: i['bad'].append('Profit fell %.0f%% vs a year ago' % abs(num)); i['fundflag'] = True
+                elif num >= 20: i['chk'].append('Profit up %.0f%% vs a year ago' % num)
+            elif lab.startswith('Revenue growth') and num <= -10: i['bad'].append('Revenue fell %.0f%% vs a year ago' % abs(num))
+        if i['tier'] == 1 and i.get('fundflag'): i['tier'] = 2
+        i['fund'] = {'src': d.get('src', []), 'at': d['at'], 'items': [[a, b] for a, b, _ in d.get('items', [])], 'notes': notes}
+        keep.append(i)
+    info['ia'] = [ia_ok, len(ia_set)]; info['ed'] = [ed_ok, len(ed_set)]; info['reused'] = len(fresh)
+    info['cache'] = {t: dict(v) for t, v in data.items() if (today - dt.date.fromisoformat(v['at'])).days <= 10 and (v.get('items') or v.get('meet') or v.get('last'))}
+    info['ia_left'] = IA_MONTH_CAP - u['ia']
+    return keep, u, info
+def _wd(today, day):
+    try: return dt.date(today.year, today.month, day).weekday() < 5
+    except ValueError: return False
 
 def _clean_name(n):
     n = re.sub(r'\(.*?\)', '', n or ''); n = re.sub(r'\b(limited|ltd\.?|corporation|corp\.?|industries|india)\b', '', n, flags=re.I)
@@ -815,6 +976,11 @@ def refresh():
                 ideas, res_w, res_t = apply_news_events(ideas, vetoed); log('Results dates from headlines: %d of %d looked up' % (res_w, res_t))
             except Exception as e: log('Results-from-news step failed:', e)
         CACHE.update(meta=uni, bars=bars, ind=inds, regimes=regs, nifty=nb)
+        API_INFO = None; API_USED = None
+        if (API_KEYS['ia'] or API_KEYS['ed']) and not MOCK or TEST_HOOK:
+            STATUS.update(msg='Looking up fundamentals for the best picks…')
+            try: ideas, API_USED, API_INFO = apply_api(ideas, vetoed, now().date(), API_PREV.get('usage'), API_PREV.get('cache') or {}); log('Fundamentals: IndianAPI %s, EODHD %s, reused %s, picked %s' % (API_INFO['ia'], API_INFO['ed'], API_INFO['reused'], API_INFO['picked']))
+            except Exception as e: log('Fundamentals step failed:', e)
         P = run_paper(ideas, bars, nb, regs, asof)
         STATUS.update(msg='Testing the strategies on history…')
         tested = {}
@@ -826,7 +992,11 @@ def refresh():
              'yahoo': (['off', 'Not used', '—', 'Yahoo blocks GitHub servers, so NSE daily files are used'] if USE_NSE else ['good' if len(failed) < 0.05 * len(syms) else 'warn', 'Healthy' if len(failed) < 0.05 * len(syms) else 'Partial', tz, f'{len(bars)} of {len(syms)} stocks downloaded' + (f', {len(failed)} failed' if failed else '')]),
              'nse_ann': (['good', 'Healthy', tz, EV_NOTE] if EVENTS else ['off', 'Mock', tz, 'Mock mode'] if MOCK else (['warn', 'Partly', tz, EV_NOTE + '. Results inferred from headlines for %d of %d ideas (not official).' % (res_w, res_t)] if res_w else ['warn', 'Unavailable', tz, EV_NOTE + '. Results dates are NOT being checked.'])),
              'rss': (['off', 'Mock', tz, 'Mock mode'] if MOCK else ['good', 'Healthy', tz, 'Headlines found for %d of %d ideas' % (news_ok, news_tried)] if news_ok else ['warn', 'Unavailable', tz, 'Google News did not answer, so no headlines are shown'] if news_tried else ['off', 'Idle', tz, 'No ideas today, nothing to look up']),
+             'indianapi': (['off', 'No key', '—', 'Not set up. Add INDIANAPI_KEY as a GitHub secret to switch on.'] if not API_KEYS['ia'] else ['warn' if (API_INFO and API_INFO['errors']) else 'good', 'Healthy' if not (API_INFO and API_INFO['errors']) else 'Problem', tz, ('%d of %d best picks looked up today; %s requests left this month' % (API_INFO['ia'][0], API_INFO['ia'][1], API_INFO['ia_left'])) if API_INFO else 'Waiting for the next run']),
+             'eodhd': (['off', 'No key', '—', 'Not set up. Add EODHD_KEY as a GitHub secret to switch on.'] if not API_KEYS['ed'] else ['warn' if (API_INFO and API_INFO['errors']) else 'good', 'Healthy' if not (API_INFO and API_INFO['errors']) else 'Problem', tz, ('%d of %d best picks looked up today (2 a day on the free plan)' % (API_INFO['ed'][0], API_INFO['ed'][1])) if API_INFO else 'Waiting for the next run']),
              'gdelt': ['off', 'Not built yet', '—', 'Planned'], 'rbi': ['off', 'Not built yet', '—', 'Planned'], 'screener': ['off', 'Off', 'never', 'Terms not yet confirmed']}
+        if API_INFO and API_INFO['errors']: inbox.append(('warn', 'Fundamentals lookup had errors', '; '.join(API_INFO['errors'][:3]), 'Skipped those lookups and kept the ideas.', 'A 401, 402 or 403 usually means the key is wrong or the free plan does not include that data. Check the key in your GitHub secrets.'))
+        if (API_KEYS['ia'] or API_KEYS['ed']) and not API_INFO: inbox.append(('info', 'Fundamentals lookup skipped', 'No ideas needed a lookup today, or the step failed.', '—', 'Nothing.'))
         age = (now().date() - dt.date.fromisoformat(asof)).days
         if age > 4: inbox.append(('crit', 'Prices look old', f'The newest Nifty price is from {asof}, {age} days ago.', 'Showed the ideas, but they are based on old prices.', 'Check your internet connection and press Refresh data.'))
         if failed: inbox.append(('warn', f'{len(failed)} stocks could not be downloaded', 'Examples: ' + ', '.join(s for s, _ in failed[:8]) + '. First error: ' + (failed[0][1] or 'unknown'), 'Left them out of today\'s ideas.', 'Usually temporary. Press Refresh data later. If it repeats, Yahoo may be limiting requests.'))
@@ -860,7 +1030,7 @@ def refresh():
         state = {'empty': False, 'mock': MOCK, 'asof': asof, 'generated': now().isoformat(timespec='seconds'), 'regime': {'idx': ri, 'label': label, 'vix': round(vix, 1), 'detail': detail},
                  'ideas': ideas, 'vetoed': vetoed, 'health': H, 'inbox': [{'id': 'r%d' % i, 'sev': a, 'title': b_, 'body': c_, 'did': d_, 'need': e_, 'when': tz} for i, (a, b_, c_, d_, e_) in enumerate(inbox)],
                  'open': openout, 'journal': P['closed'][-300:][::-1], 'pending': len(P['pending']), 'eq': {'dates': last160, 'bot': eqb, 'nifty': eqn}, 'tested': tested,
-                 'universe': {'n': len(syms), 'got': len(bars), 'skipped_short_history': skipped, 'failed': [s for s, _ in failed][:40]}, 'seconds': round(time.time() - t0)}
+                 'api_usage': API_USED or API_PREV.get('usage'), 'fund_cache': (API_INFO or {}).get('cache') or API_PREV.get('cache') or {}, 'universe': {'n': len(syms), 'got': len(bars), 'skipped_short_history': skipped, 'failed': [s for s, _ in failed][:40]}, 'seconds': round(time.time() - t0)}
         jsave(os.path.join(DATA, 'state.json'), state); CACHE['state'] = state
         STATUS.update(msg=f'Done. Prices up to {asof}.', done=STATUS['total'])
     except Exception as e:

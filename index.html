@@ -218,7 +218,9 @@ const SOURCES = [
   { id: 'rss', name: 'News feeds (Google News, Economic Times, Moneycontrol, Business Standard)', supplies: 'Live headlines', kind: 'Free RSS', on: true },
   { id: 'gdelt', name: 'GDELT', supplies: 'Historical news tone, research only', kind: 'Free archive', on: true },
   { id: 'rbi', name: 'RBI and NSDL releases', supplies: 'Macro data, foreign portfolio flows', kind: 'Free official', on: true },
-  { id: 'screener', name: 'Screener.in and Trendlyne', supplies: 'Fundamentals', kind: 'Free, terms to be confirmed', on: false, note: 'Off until their terms of use are confirmed.' }
+  { id: 'screener', name: 'Screener.in and Trendlyne', supplies: 'Fundamentals', kind: 'Free, terms to be confirmed', on: false, note: 'Off until their terms of use are confirmed.' },
+  { id: 'indianapi', name: 'IndianAPI.in (free plan)', supplies: 'Board meetings and results dates, dividends. Best picks only, up to 5 a day', kind: 'Free plan, 500 requests a month', on: true, note: 'Runs in the daily update. To switch off, delete the INDIANAPI_KEY secret on GitHub.' },
+  { id: 'eodhd', name: 'EODHD (free plan)', supplies: 'Profit and revenue growth, return on equity, last report date. Best 2 picks a day', kind: 'Free plan, 20 calls a day', on: true, note: 'Runs in the daily update. To switch off, delete the EODHD_KEY secret on GitHub.' }
 ];
 const HEALTH = { nse_eod: ['good', 'Healthy', '18:42 yesterday', 'File read in 3.1 s'], nse_ann: ['warn', 'Slow', '18:44 yesterday', 'Page answered after 14 s'], yahoo: ['good', 'Healthy', '18:43 yesterday', 'Prices match NSE on 499 of 500 stocks'], rss: ['good', 'Healthy', '06:10 today', '412 headlines read'], gdelt: ['good', 'Healthy', '02:00 today', 'Tone scores updated'], rbi: ['good', 'Healthy', '19 Nov, 09:00', 'Weekly release read'], screener: ['off', 'Off', 'never', 'Terms not yet confirmed'] };
 
@@ -1042,9 +1044,9 @@ if (STATIC) {
 (function () { try { const st = document.createElement('style'); st.textContent = '.evb{margin:8px 0;padding:8px 10px;border-radius:8px;font-size:12.5px;line-height:1.4;border:1px solid var(--line);background:var(--surface2,var(--surface));color:var(--ink2)}.evb.warn{border-color:var(--warn-text,#b45309);color:var(--warn-text,#b45309)}.evb b{font-weight:600}.news{margin:8px 0 6px;padding:0;list-style:none;font-size:12.5px}.news li{margin:3px 0;color:var(--ink2)}.news a{color:inherit;text-decoration:underline}.news .nf{color:var(--crit);font-weight:600}.news small{opacity:.75}'; document.head.appendChild(st); } catch (e) { } })();
 function evHtml(d) {
   const nw = d.new ? '<div class="evb"><b>New today.</b> It was not in yesterday\'s list.</div>' : '';
-  const e = d.ev; if (!e) return nw;
+  const e = d.ev; if (!e) return nw + fundHtml(d);
   const lab = e.lvl === 'warn' ? 'Results risk. ' : e.lvl === 'unk' ? 'Not checked. ' : e.lvl === 'ok' ? 'Results. ' : 'Results. ';
-  return nw + `<div class="evb ${e.lvl === 'warn' || e.lvl === 'unk' ? 'warn' : ''}"><b>${lab}</b>${esc(e.text)}${e.src === 'news' ? ' <i>(inferred from headlines)</i>' : ''}</div>`;
+  return nw + `<div class="evb ${e.lvl === 'warn' || e.lvl === 'unk' ? 'warn' : ''}"><b>${lab}</b>${esc(e.text)}${e.src === 'news' ? ' <i>(inferred from headlines)</i>' : e.src === 'indianapi' ? ' <i>(from IndianAPI)</i>' : e.src === 'eodhd' ? ' <i>(estimate from EODHD)</i>' : ''}</div>` + fundHtml(d);
 }
 function newsHtml(d) {
   if (d.news === undefined) return '';
@@ -1103,6 +1105,12 @@ function stressHtml(res) {
   <div class="tblw"><table><thead><tr><th>Test</th><th class="r">Average per trade</th></tr></thead><tbody>${tests.map(t => `<tr><td>${esc(t[0])}${t[2] ? `<br><small class="sub">${esc(t[2])}</small>` : ''}</td><td class="r ${c(t[1])}">${R(t[1])}</td></tr>`).join('')}</tbody></table></div>
   <p class="sub" style="margin:6px 0">Worst year: ${z.worst.y} (${z.worst.ret >= 0 ? '+' : '−'}${Math.abs(z.worst.ret).toFixed(1)}%). Longest losing streak: ${z.streak} trades in a row.</p>
   <div class="tblw"><table><thead><tr><th>Size of company</th><th class="r">Trades</th><th class="r">Average per trade</th></tr></thead><tbody>${z.seg.map(x => `<tr><td>${x.nm} cap</td><td class="r">${x.n}</td><td class="r ${c(x.exp)}">${R(x.exp)}</td></tr>`).join('')}</tbody></table></div>`;
+}
+
+function fundHtml(d) {
+  const f = d.fund; if (!f || !((f.items && f.items.length) || (f.notes && f.notes.length))) return '';
+  const when = f.at ? new Date(f.at + 'T00:00:00').toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }) : '';
+  return `<div class="evb"><b>Fundamentals</b> <small>${esc((f.src || []).join(' + '))}${when ? ' · looked up ' + when : ''}</small>${f.items && f.items.length ? '<br>' + f.items.map(x => esc(x[0]) + ': <b>' + esc(x[1]) + '</b>').join(' · ') : ''}${(f.notes || []).map(n => '<br>' + esc(n)).join('')}</div>`;
 }
 
 (function boot() {
