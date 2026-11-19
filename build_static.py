@@ -25,6 +25,10 @@ while tried < 5:
     d -= _dt.timedelta(days=1)
 try: s.http_get(s.idx_url(d), tries=1, timeout=30); print('PROBE ok      NSE daily index file', d)
 except Exception as e: print('PROBE no      NSE daily index file', d, '->', str(e)[:60])
+probe('Google News headlines', 'https://news.google.com/rss/search?q=reliance+shares&hl=en-IN&gl=IN&ceid=IN:en')
+try:
+    _ev, _note = s.fetch_events(_dt.date.today()); print('PROBE', 'ok     ' if _ev else 'blocked', 'NSE results calendar ->', _note)
+except Exception as e: print('PROBE blocked NSE results calendar ->', str(e)[:80])
 print('---')
 s.USE_NSE = True            # Yahoo blocks GitHub's servers, so use NSE's own daily files
 s.refresh()
