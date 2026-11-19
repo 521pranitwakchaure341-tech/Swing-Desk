@@ -406,11 +406,28 @@ def _pct(v):
     except Exception: return None
     return v * 100 if abs(v) <= 5 else v
 def api_json(url, headers=None):
-    return json.loads(http_get(url, tries=2, timeout=30, headers=headers).decode('utf-8', 'replace'))
+    try: return json.loads(http_get(url, tries=2, timeout=30, headers=headers).decode('utf-8', 'replace'))
+    except urllib.error.HTTPError as e:
+        body = ''
+        try: body = e.read().decode('utf-8', 'replace').strip().replace('\n', ' ')[:120]
+        except Exception: pass
+        key = API_KEYS['ia'] or API_KEYS['ed']
+        if key: body = body.replace(key, '***')
+        raise RuntimeError('HTTP %s %s' % (e.code, body))
+def shape(o, depth=0):
+    """Short description of a JSON answer's layout (keys only, never values) so it can be read off the Data health screen."""
+    if isinstance(o, dict):
+        return '{' + ', '.join(k + (':' + shape(v, depth + 1) if depth < 1 and isinstance(v, (dict, list)) else '') for k, v in list(o.items())[:14]) + '}'
+    if isinstance(o, list): return '[%d]' % len(o) + (shape(o[0], depth + 1) if o and depth < 1 else '')
+    return ''
 def ia_fetch(name):
     return api_json('https://stock.indianapi.in/stock?name=' + urllib.parse.quote(name), {'x-api-key': API_KEYS['ia']})
 def ed_fetch(sym):
-    return api_json('https://eodhd.com/api/v1.1/fundamentals/%s.NSE?api_token=%s&filter=%s' % (urllib.parse.quote(sym), urllib.parse.quote(API_KEYS['ed']), 'Highlights,Valuation,Earnings'))
+    q = urllib.parse.quote(sym); tok = urllib.parse.quote(API_KEYS['ed'])
+    try: return api_json('https://eodhd.com/api/v1.1/fundamentals/%s.NSE?api_token=%s&filter=%s' % (q, tok, 'Highlights,Valuation,Earnings'))
+    except RuntimeError as e:
+        if 'HTTP 404' not in str(e): raise
+        return api_json('https://eodhd.com/api/fundamentals/%s.NSE?api_token=%s&fmt=json' % (q, tok))
 def ia_parse(j, today):
     """Pulls board-meeting / results dates and dividend dates out of IndianAPI's answer, whatever its exact layout."""
     out = {'meet': None, 'div': None, 'keys': sorted(j.keys())[:25] if isinstance(j, dict) else []}
@@ -491,9 +508,9 @@ def apply_api(ideas, vetoed, today, prev_usage, cache):
             r = ia_parse(j, today); ia_ok += 1; d['src'] = sorted(set(d['src'] + ['IndianAPI']))
             if r['meet']: d['meet'] = [r['meet'][0].isoformat(), r['meet'][1]]
             if r['div']: d['div'] = r['div'].isoformat()
-            if ia_ok == 1: print('API SHAPE IndianAPI top-level keys:', r['keys'])
+            if ia_ok == 1: info['shape_ia'] = shape(j)[:380]; print('API SHAPE IndianAPI:', info['shape_ia'])
         except Exception as e:
-            info['errors'].append('IndianAPI ' + t + ': ' + str(e)[:80])
+            info['errors'].append('IndianAPI ' + t + ': ' + str(e)[:140]); info['err_ia'] = True
             if '401' in str(e) or '403' in str(e) or '402' in str(e): break
         time.sleep(0.5)
     for t in ed_set:
@@ -503,9 +520,9 @@ def apply_api(ideas, vetoed, today, prev_usage, cache):
             j = ed_fetch(t); r = ed_parse(j, today); ed_ok += 1; d['src'] = sorted(set(d['src'] + ['EODHD']))
             d['items'] = [x[:3] for x in r['items']]
             if r['last']: d['last'] = r['last'].isoformat()
-            if ed_ok == 1: print('API SHAPE EODHD sections:', r['keys'], '| fields read:', len(r['items']))
+            if ed_ok == 1: info['shape_ed'] = shape(j)[:300]; print('API SHAPE EODHD:', info['shape_ed'], '| fields read:', len(r['items']))
         except Exception as e:
-            info['errors'].append('EODHD ' + t + ': ' + str(e)[:80])
+            info['errors'].append('EODHD ' + t + ': ' + str(e)[:140]); info['err_ed'] = True
             if '401' in str(e) or '402' in str(e) or '403' in str(e): break
         time.sleep(0.5)
     keep = []
@@ -992,8 +1009,8 @@ def refresh():
              'yahoo': (['off', 'Not used', '—', 'Yahoo blocks GitHub servers, so NSE daily files are used'] if USE_NSE else ['good' if len(failed) < 0.05 * len(syms) else 'warn', 'Healthy' if len(failed) < 0.05 * len(syms) else 'Partial', tz, f'{len(bars)} of {len(syms)} stocks downloaded' + (f', {len(failed)} failed' if failed else '')]),
              'nse_ann': (['good', 'Healthy', tz, EV_NOTE] if EVENTS else ['off', 'Mock', tz, 'Mock mode'] if MOCK else (['warn', 'Partly', tz, EV_NOTE + '. Results inferred from headlines for %d of %d ideas (not official).' % (res_w, res_t)] if res_w else ['warn', 'Unavailable', tz, EV_NOTE + '. Results dates are NOT being checked.'])),
              'rss': (['off', 'Mock', tz, 'Mock mode'] if MOCK else ['good', 'Healthy', tz, 'Headlines found for %d of %d ideas' % (news_ok, news_tried)] if news_ok else ['warn', 'Unavailable', tz, 'Google News did not answer, so no headlines are shown'] if news_tried else ['off', 'Idle', tz, 'No ideas today, nothing to look up']),
-             'indianapi': (['off', 'No key', '—', 'Not set up. Add INDIANAPI_KEY as a GitHub secret to switch on.'] if not API_KEYS['ia'] else ['warn' if (API_INFO and API_INFO['errors']) else 'good', 'Healthy' if not (API_INFO and API_INFO['errors']) else 'Problem', tz, ('%d of %d best picks looked up today; %s requests left this month' % (API_INFO['ia'][0], API_INFO['ia'][1], API_INFO['ia_left'])) if API_INFO else 'Waiting for the next run']),
-             'eodhd': (['off', 'No key', '—', 'Not set up. Add EODHD_KEY as a GitHub secret to switch on.'] if not API_KEYS['ed'] else ['warn' if (API_INFO and API_INFO['errors']) else 'good', 'Healthy' if not (API_INFO and API_INFO['errors']) else 'Problem', tz, ('%d of %d best picks looked up today (2 a day on the free plan)' % (API_INFO['ed'][0], API_INFO['ed'][1])) if API_INFO else 'Waiting for the next run']),
+             'indianapi': (['off', 'No key', '—', 'Not set up. Add INDIANAPI_KEY as a GitHub secret to switch on.'] if not API_KEYS['ia'] else ['warn' if (API_INFO and API_INFO.get('err_ia')) else 'good', 'Healthy' if not (API_INFO and API_INFO.get('err_ia')) else 'Problem', tz, (('%d of %d best picks looked up today; %s requests left this month. ' % (API_INFO['ia'][0], API_INFO['ia'][1], API_INFO['ia_left'])) + ('Layout: ' + API_INFO['shape_ia'] if API_INFO.get('shape_ia') else '') + ' '.join(e for e in API_INFO['errors'] if e.startswith('IndianAPI'))) if API_INFO else 'Waiting for the next run']),
+             'eodhd': (['off', 'No key', '—', 'Not set up. Add EODHD_KEY as a GitHub secret to switch on.'] if not API_KEYS['ed'] else ['warn' if (API_INFO and API_INFO.get('err_ed')) else 'good', 'Healthy' if not (API_INFO and API_INFO.get('err_ed')) else 'Problem', tz, (('%d of %d best picks looked up today (2 a day on the free plan). ' % (API_INFO['ed'][0], API_INFO['ed'][1])) + ('Layout: ' + API_INFO['shape_ed'] if API_INFO.get('shape_ed') else '') + ' '.join(e for e in API_INFO['errors'] if e.startswith('EODHD'))) if API_INFO else 'Waiting for the next run']),
              'gdelt': ['off', 'Not built yet', '—', 'Planned'], 'rbi': ['off', 'Not built yet', '—', 'Planned'], 'screener': ['off', 'Off', 'never', 'Terms not yet confirmed']}
         if API_INFO and API_INFO['errors']: inbox.append(('warn', 'Fundamentals lookup had errors', '; '.join(API_INFO['errors'][:3]), 'Skipped those lookups and kept the ideas.', 'A 401, 402 or 403 usually means the key is wrong or the free plan does not include that data. Check the key in your GitHub secrets.'))
         if (API_KEYS['ia'] or API_KEYS['ed']) and not API_INFO: inbox.append(('info', 'Fundamentals lookup skipped', 'No ideas needed a lookup today, or the step failed.', '—', 'Nothing.'))
