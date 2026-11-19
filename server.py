@@ -480,7 +480,30 @@ def nse_load(uni, deadline_min=None):
                 if cl > 0 and pc > 0 and abs(pc / cl - 1) > 0.04: fac *= pc / cl; adj += 1
             r = rows[i][1]; o[i], h[i], l[i], c[i] = (round(x * fac, 3) for x in r[:4]); v[i] = int(r[5] / fac) if fac > 0 else r[5]
         bars[sym] = {'d': [x[0] for x in rows], 'o': o, 'h': h, 'l': l, 'c': c, 'v': v}
-    info = f"{len(dates)} trading days from {dates[0]} to {dates[-1]}; {adj} split/bonus adjustments; {len(bars)} of {len(uni)} stocks have history"
+    # Days with no official Nifty value (NSE did not publish the index file): estimate from the average move of the large stocks
+    filled = 0
+    have = {d: i for i, d in enumerate(nb['d'])}
+    if nb['d']:
+        large = [x for x in bars if uni[x]['seg'] == 'Large']
+        idx_by = {x: {d: k for k, d in enumerate(bars[x]['d'])} for x in large}
+        def avg_ret(d0, d1):
+            rs = []
+            for x in large:
+                m = idx_by[x]; i0, i1 = m.get(d0), m.get(d1)
+                if i0 is not None and i1 is not None and bars[x]['c'][i0] > 0: rs.append(bars[x]['c'][i1] / bars[x]['c'][i0] - 1)
+            return sum(rs) / len(rs) if rs else 0.0
+        out = {'d': [], 'o': [], 'h': [], 'l': [], 'c': [], 'v': []}; last_d = None; last_c = None
+        for dd in dates:
+            if dd in have:
+                i = have[dd]
+                for k in 'ohlc': out[k].append(nb[k][i])
+                out['d'].append(dd); out['v'].append(0); last_d, last_c = dd, nb['c'][i]
+            elif last_c is not None:
+                c = last_c * (1 + avg_ret(last_d, dd)); out['d'].append(dd)
+                for k in 'ohlc': out[k].append(round(c, 2))
+                out['v'].append(0); last_d, last_c = dd, c; filled += 1
+        nb = out
+    info = f"{len(dates)} trading days from {dates[0]} to {dates[-1]}; {adj} split/bonus adjustments; {len(bars)} of {len(uni)} stocks have history; {filled} days had no official Nifty value and were estimated from the large stocks"
     if not bars: raise RuntimeError('No stock history could be built from the NSE files.')
     return bars, nb, (vb if len(vb['d']) > 60 else None), failed, info
 
